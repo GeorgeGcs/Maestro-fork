@@ -82,6 +82,11 @@ internal object HarmonyOsSessionSupport {
                     ?: throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_PORT must be 1024..65535.")
             },
             layoutRpcDevice = environment["MAESTRO_HARMONYOS_LAYOUT_RPC_DEVICE"],
+            arkWebPort = environment["MAESTRO_HARMONYOS_ARKWEB_PORT"]?.let {
+                it.toIntOrNull()?.takeIf { port -> port in 1024..65535 }
+                    ?: throw CliError("MAESTRO_HARMONYOS_ARKWEB_PORT must be 1024..65535.")
+            },
+            arkWebBundle = environment["MAESTRO_HARMONYOS_ARKWEB_BUNDLE"],
             enableScreenRecording = when (val backend = environment["MAESTRO_HARMONYOS_RECORDING"]?.trim()) {
                 null, "", "off" -> false
                 "huawei-system" -> true

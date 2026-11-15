@@ -71,6 +71,13 @@ class HdcClient(
         return matchesUitestLayoutForward(result.stdout, deviceId, port)
     }
 
+    internal fun hasArkWebForward(deviceId: String, port: Int, pid: String, timeout: Duration): Boolean {
+        validateDeviceId(deviceId)
+        val result = execute(listOf("fport", "ls"), timeout, category = HdcCommandCategory.LAYOUT_FORWARD_LIST)
+        if (result.stderr.isNotBlank()) throw HdcException("HDC forward listing returned diagnostics")
+        return matchesForward(result.stdout, deviceId, port, "localabstract:webview_devtools_remote_$pid")
+    }
+
     /**
      * Arguments are quoted for the device shell as well as kept separate from host options.
      * The exit code belongs to the host HDC process; callers must also check device-command results.
@@ -229,10 +236,14 @@ class HdcClient(
         private fun hasHdcFailure(output: String): Boolean = hdcFailurePattern.containsMatchIn(output)
 
         internal fun matchesUitestLayoutForward(output: String, deviceId: String, port: Int): Boolean {
+            return matchesForward(output, deviceId, port, "localabstract:uitest_socket")
+        }
+
+        private fun matchesForward(output: String, deviceId: String, port: Int, remote: String): Boolean {
             val local = "tcp:$port"
             val matching = output.lineSequence().map { it.trim().split(Regex("\\s+")) }
                 .filter { it.getOrNull(1) == local }.toList()
-            return matching == listOf(listOf(deviceId, local, "localabstract:uitest_socket", "[Forward]"))
+            return matching == listOf(listOf(deviceId, local, remote, "[Forward]"))
         }
 
         internal fun parseDeviceList(output: String): List<String> {

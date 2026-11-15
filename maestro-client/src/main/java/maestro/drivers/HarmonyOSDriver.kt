@@ -41,7 +41,7 @@ class HarmonyOSDriver(
         config: HarmonyOSDriverConfig = HarmonyOSDriverConfig(),
     ) : this(HdcHarmonyOSDevice(deviceId, hdc, config.layoutRpcPort.also {
         require(it == null || deviceId == config.layoutRpcDevice) { "Layout RPC target differs from the selected device" }
-    }), config)
+    }, config.arkWebPort, config.arkWebBundle), config)
 
     @Volatile private var opened = false
     private var recording: ScreenRecording? = null

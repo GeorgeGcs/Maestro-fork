@@ -15,10 +15,15 @@ data class HarmonyOSDriverConfig(
     val recordingRetainMedia: Boolean = false,
     val layoutRpcPort: Int? = null,
     val layoutRpcDevice: String? = null,
+    val arkWebPort: Int? = null,
+    val arkWebBundle: String? = null,
 ) {
     init {
         require((layoutRpcPort == null) == (layoutRpcDevice == null)) { "Set both layout RPC port and target device" }
         layoutRpcPort?.let { require(it in 1024..65535) { "Layout RPC port must be 1024..65535" } }
+        require((arkWebPort == null) == (arkWebBundle == null)) { "Set both ArkWeb port and test bundle" }
+        arkWebPort?.let { require(it in 1024..65535) { "ArkWeb port must be 1024..65535" } }
+        arkWebBundle?.let { requireIdentifier(it, "ArkWeb bundle") }
         for (timeout in listOf(commandTimeout, settleTimeout, pollInterval)) {
             require(timeout >= Duration.ofMillis(1) && timeout <= Duration.ofMinutes(5)) {
                 "HarmonyOS timeouts must be between 1 ms and 5 minutes"
