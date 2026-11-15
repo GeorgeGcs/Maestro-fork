@@ -426,11 +426,15 @@ class ArtifactsGeneratorTest {
         val cmd = MaestroCommand(scrollCommand = ScrollCommand())
 
         gen.onFlowStart()
-        gen.onCommandStart(cmd, sequenceNumber = 0)
+        try {
+            gen.onCommandStart(cmd, sequenceNumber = 0)
 
-        // Reported at command start — before the command runs.
-        assertThat(tempDir.resolve("screenshots/step-001-scroll.png").exists()).isTrue()
-        assertThat(captured).containsExactly(0 to "screenshots/step-001-scroll.png")
+            // Reported at command start — before the command runs.
+            assertThat(tempDir.resolve("screenshots/step-001-scroll.png").exists()).isTrue()
+            assertThat(captured).containsExactly(0 to "screenshots/step-001-scroll.png")
+        } finally {
+            gen.onFlowEnd()
+        }
     }
 
     @Test
@@ -564,10 +568,14 @@ class ArtifactsGeneratorTest {
         val cmd = MaestroCommand(tapOnElement = null)
 
         gen.onFlowStart()
-        gen.onCommandStart(cmd, sequenceNumber = 0)
+        try {
+            gen.onCommandStart(cmd, sequenceNumber = 0)
 
-        // Flag off: no pre-command shot.
-        assertThat(tempDir.resolve("screenshots/step-0.png").exists()).isFalse()
+            // Flag off: no pre-command shot.
+            assertThat(tempDir.resolve("screenshots/step-0.png").exists()).isFalse()
+        } finally {
+            gen.onFlowEnd()
+        }
     }
 
     @Test
@@ -1155,13 +1163,17 @@ class ArtifactsGeneratorTest {
         val cmd = MaestroCommand(scrollCommand = ScrollCommand())
 
         gen.onFlowStart()
-        val thrown = runCatching {
-            gen.onCommandStart(cmd, sequenceNumber = 0)
-        }.exceptionOrNull()
+        try {
+            val thrown = runCatching {
+                gen.onCommandStart(cmd, sequenceNumber = 0)
+            }.exceptionOrNull()
 
-        assertThat(thrown).isInstanceOf(RuntimeException::class.java)
-        assertThat(thrown!!.message).isEqualTo("consumer boom")
-        assertThat(tempDir.resolve("screenshots/step-001-scroll.png").exists()).isTrue()
+            assertThat(thrown).isInstanceOf(RuntimeException::class.java)
+            assertThat(thrown!!.message).isEqualTo("consumer boom")
+            assertThat(tempDir.resolve("screenshots/step-001-scroll.png").exists()).isTrue()
+        } finally {
+            gen.onFlowEnd()
+        }
     }
 
     @Test

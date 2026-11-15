@@ -6,6 +6,9 @@ import org.junit.jupiter.api.Test
 
 class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
 
+    // Jackson uses the platform line separator; Kotlin trimIndent() uses LF.
+    private fun Buffer.readXmlText(): String = readUtf8().replace("\r\n", "\n")
+
     @Test
     fun `XML - Test passed`() {
         // Given
@@ -17,7 +20,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testSuccessWithWarning,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -45,7 +48,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testSuccessWithError,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -75,7 +78,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testSuccessWithWarning,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -103,7 +106,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testWithTagsAndProperties,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -144,7 +147,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testSuccessWithoutFilePath,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -171,7 +174,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testWithCloudMetadata,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(
@@ -207,7 +210,7 @@ class JUnitTestSuiteReporterTest : TestSuiteReporterTest() {
             summary = testWithCustomIdAndClassname,
             out = sink
         )
-        val resultStr = sink.readUtf8()
+        val resultStr = sink.readXmlText()
 
         // Then
         assertThat(resultStr).isEqualTo(

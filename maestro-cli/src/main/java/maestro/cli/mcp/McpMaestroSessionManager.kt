@@ -74,6 +74,7 @@ internal class McpMaestroSessionManager : AutoCloseable {
             Platform.ANDROID -> createAndroidSession(device, streamDeviceType)
             Platform.IOS -> createIosSession(device, streamDeviceType)
             Platform.WEB -> createWebSession()
+            Platform.HARMONYOS -> throw CliError("HarmonyOS sessions are not supported by the MCP server yet; use maestro --platform harmonyos test.")
         }
     }
 

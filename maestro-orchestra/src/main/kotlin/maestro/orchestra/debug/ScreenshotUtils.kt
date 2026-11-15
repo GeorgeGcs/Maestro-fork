@@ -21,7 +21,9 @@ object ScreenshotUtils {
             ?: File.createTempFile("screenshot-${System.currentTimeMillis()}", ".png")
                 .also { it.deleteOnExit() }
         return kotlin.runCatching {
-            runBlocking { maestro.takeScreenshot(out.sink(), false) }
+            out.sink().use { sink ->
+                runBlocking { maestro.takeScreenshot(sink, false) }
+            }
             out
         }.getOrElse {
             out.delete() // don't leak a zero-byte file if capture threw mid-write

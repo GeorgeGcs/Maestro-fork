@@ -19,6 +19,7 @@
 
 package maestro.cli.command
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -37,6 +38,7 @@ import maestro.cli.analytics.WorkspaceRunFailedEvent
 import maestro.cli.analytics.WorkspaceRunFinishedEvent
 import maestro.cli.analytics.WorkspaceRunStartedEvent
 import maestro.device.Device
+import maestro.drivers.HarmonyOSDriver
 import maestro.device.DeviceService
 import maestro.cli.model.TestExecutionSummary
 import maestro.cli.report.ReportFormat
@@ -47,6 +49,9 @@ import maestro.cli.runner.TestSuiteInteractor
 import maestro.cli.runner.resultview.AnsiResultView
 import maestro.cli.runner.resultview.PlainTextResultView
 import maestro.cli.session.MaestroSessionManager
+import maestro.cli.session.HarmonyOsSessionSupport
+import maestro.cli.harmonyos.HarmonyOsCliAgentReport
+import maestro.cli.harmonyos.HarmonyOsInteractiveRun
 import maestro.cli.util.CiUtils
 import maestro.cli.util.isPortAvailable
 import maestro.cli.util.EnvUtils
@@ -62,6 +67,7 @@ import maestro.cli.model.FlowStatus
 import maestro.cli.view.cyan
 import maestro.cli.promotion.PromotionStateManager
 import maestro.orchestra.error.ValidationError
+import maestro.orchestra.util.Env.withInjectedShellEnvVars
 import maestro.orchestra.workspace.WorkspaceExecutionPlanner
 import maestro.orchestra.workspace.WorkspaceExecutionPlanner.ExecutionPlan
 import maestro.utils.isSingleFile
@@ -80,7 +86,7 @@ import maestro.device.Platform
 
 @CommandLine.Command(
     name = "test",
-    description = ["Test a Flow or set of Flows on a local iOS Simulator or Android Emulator"],
+    description = ["Test a Flow or set of Flows on a local device or browser (Android, iOS, HarmonyOS, web)"],
 )
 class TestCommand : Callable<Int> {
 
@@ -155,6 +161,20 @@ class TestCommand : Callable<Int> {
     )
     private var testOutputDir: String? = null
 
+    @Option(names = ["--harmonyos-agent-output"], description = ["Persist HarmonyOS agent v1 results and evidence under this directory"])
+    private var harmonyOsAgentOutput: File? = null
+
+    @Option(names = ["--harmonyos-run-id"])
+    private var harmonyOsRunId: String? = null
+
+    @Option(names = ["--harmonyos-attempt-id"])
+    private var harmonyOsAttemptId: String? = null
+
+    @Option(names = ["--harmonyos-attempt-no"])
+    private var harmonyOsAttemptNo: Int = 1
+
+    private var harmonyOsAgentReport: HarmonyOsCliAgentReport? = null
+
     @Option(
         names = ["--flatten-debug-output"],
         description = ["All file outputs from the test case are created in the folder without subfolders or timestamps for each run. It can be used with --debug-output. Useful for CI."]
@@ -219,7 +239,7 @@ class TestCommand : Callable<Int> {
     )
     private var appleTeamId: String? = null
 
-    @Option(names = ["-p", "--platform"], description = ["Select a platform to run on"])
+    @Option(names = ["-p", "--platform"], description = ["Select a platform: android, ios, web, harmonyos"])
     var platform: String? = null
 
     @Option(
@@ -247,6 +267,52 @@ class TestCommand : Callable<Int> {
     }
   
     override fun call(): Int {
+        val agentRoot = harmonyOsAgentOutput ?: return executeTests()
+        if (!isHarmonyOs()) throw CliError("--harmonyos-agent-output requires --platform harmonyos.")
+        // Resolve an automatic target through read-only discovery before registration.
+        // The registered input and every later session then name the same actual device.
+        var selectionFailure: Throwable? = null
+        val requestedDevice = deviceId ?: parent?.deviceId
+        val selectedDevice = try {
+            HarmonyOsSessionSupport.selectDevice(requestedDevice)
+        } catch (error: Throwable) {
+            selectionFailure = error
+            requestedDevice
+        }
+        harmonyOsAgentReport = HarmonyOsCliAgentReport.create(
+            agentRoot.toPath(), harmonyOsRunId, harmonyOsAttemptId, harmonyOsAttemptNo,
+            selectedDevice, flowFiles,
+            mapOf("environment" to env.withInjectedShellEnvVars(), "config" to configFile?.takeIf { it.isFile }?.readText(),
+                "ability" to System.getenv("MAESTRO_HARMONYOS_ABILITY"), "module" to System.getenv("MAESTRO_HARMONYOS_MODULE"),
+                "includeTags" to includeTags, "excludeTags" to excludeTags, "continuous" to continuous,
+                "shardSplit" to shardSplit, "shardAll" to shardAll, "analyze" to analyze,
+                "format" to format.name),
+        )
+        val report = harmonyOsAgentReport!!
+        if (System.getenv("MAESTRO_HARMONYOS_INTERACTIVE") == "1") {
+            report.interactive = HarmonyOsInteractiveRun(agentRoot.toPath(), report.directory.fileName.toString())
+        }
+        testOutputDir = report.directory.resolve("flows").toString()
+        // Keep the existing JUnit reporter and bundle layout for opt-in invocations.
+        if (format == ReportFormat.NOOP) format = ReportFormat.JUNIT
+        if (output == null) output = report.directory.resolve(if (format == ReportFormat.JUNIT) "junit.xml" else "report${format.fileExtension}").toFile()
+        return try {
+            selectionFailure?.let { throw it }
+            deviceId = selectedDevice
+            if (continuous) throw CliError("Agent results require a finite test invocation; --continuous is not supported.")
+            executeTests().also { result ->
+                if (format == ReportFormat.JUNIT) output?.let { report.junit(it.toPath()) }
+                report.finish(result == 0)
+            }
+        } catch (error: Throwable) {
+            try { report.finish(false, error) } catch (reportError: Throwable) {
+                if (reportError !== error) error.addSuppressed(reportError)
+            }
+            throw error
+        }
+    }
+
+    private fun executeTests(): Int {
         TestDebugReporter.install(
             debugOutputPathAsString = debugOutput,
             flattenDebugOutput = flattenDebugOutput,
@@ -279,7 +345,7 @@ class TestCommand : Callable<Int> {
                 config = configFile?.toPath()?.toAbsolutePath(),
             )
         } catch (e: ValidationError) {
-            throw CliError(e.message)
+            throw CliError(e.message).also { it.initCause(e) }
         }
 
         val resolvedTestOutputDir = resolveTestOutputDir(executionPlan)
@@ -331,6 +397,7 @@ class TestCommand : Callable<Int> {
      * Get the list of device IDs that will be used for test execution
      */
     private fun getDeviceIds(plan: ExecutionPlan): List<String> {
+        if (isHarmonyOs()) return getHarmonyOsDeviceIds(plan)
         val includeWeb = executionPlanIncludesWebFlow(plan)
         val connectedDevices = DeviceService.listConnectedDevices(
             includeWeb = includeWeb,
@@ -342,6 +409,25 @@ class TestCommand : Callable<Int> {
             .filter { device -> device in availableDevices }
             .ifEmpty { availableDevices }
             .toList()
+    }
+
+    private fun isHarmonyOs(): Boolean =
+        (platform ?: parent?.platform)?.let { Platform.fromString(it) } == Platform.HARMONYOS
+
+    private fun getHarmonyOsDeviceIds(plan: ExecutionPlan): List<String> {
+        HarmonyOsSessionSupport.validateOptions(
+            host = parent?.host,
+            port = parent?.port,
+            driverHostPort = driverHostPort ?: parent?.driverHostPort,
+            teamId = appleTeamId,
+            isHeadless = headless,
+            screenSize = screenSize,
+        )
+        return HarmonyOsSessionSupport.selectTestDeviceIds(
+            requestedIds = getPassedOptionsDeviceIds(plan),
+            shards = shardSplit ?: shardAll ?: 1,
+            includesWeb = executionPlanIncludesWebFlow(plan),
+        )
     }
 
     private fun resolveTestOutputDir(plan: ExecutionPlan): Path? {
@@ -368,27 +454,31 @@ class TestCommand : Callable<Int> {
           PrintUtils.warn("Web support is in Beta. We would appreciate your feedback!\n")
         }
 
-        val connectedDevices = DeviceService.listConnectedDevices(
-            includeWeb = includeWeb,
-            host = parent?.host,
-            port = parent?.port,
-        )
-        val availableDevicesIds = connectedDevices.map { it.instanceId }.toSet()
-        val deviceIds = getPassedOptionsDeviceIds(plan)
-            .filter { device ->
-                if (device !in availableDevicesIds) {
-                    throw CliError("Device $device was requested, but it is not connected.")
-                } else {
-                    true
+        val deviceIds = if (isHarmonyOs()) {
+            getHarmonyOsDeviceIds(plan)
+        } else {
+            val connectedDevices = DeviceService.listConnectedDevices(
+                includeWeb = includeWeb,
+                host = parent?.host,
+                port = parent?.port,
+            )
+            val availableDevicesIds = connectedDevices.map { it.instanceId }.toSet()
+            getPassedOptionsDeviceIds(plan)
+                .filter { device ->
+                    if (device !in availableDevicesIds) {
+                        throw CliError("Device $device was requested, but it is not connected.")
+                    } else {
+                        true
+                    }
                 }
-            }
-            .ifEmpty {
-                val platform = platform ?: parent?.platform
-                connectedDevices
-                    .filter { platform == null || it.platform == Platform.fromString(platform) }
-                    .map { it.instanceId }.toSet()
-            }
-            .toList()
+                .ifEmpty {
+                    val platform = platform ?: parent?.platform
+                    connectedDevices
+                        .filter { platform == null || it.platform == Platform.fromString(platform) }
+                        .map { it.instanceId }.toSet()
+                }
+                .toList()
+        }
 
         val missingDevices = requestedShards - deviceIds.size
         if (missingDevices > 0) {
@@ -468,12 +558,14 @@ class TestCommand : Callable<Int> {
         chunkPlans: List<ExecutionPlan>,
         debugOutputPath: Path,
     ): Triple<Int?, Int?, TestExecutionSummary?> {
-        val driverHostPort = selectPort(effectiveShards)
+        val driverHostPort = if (isHarmonyOs()) null else selectPort(effectiveShards)
         val deviceId = deviceIds[shardIndex]
+        harmonyOsAgentReport?.selectedDevice(deviceId)
         val executionPlan = chunkPlans[shardIndex]
 
         logger.info("[shard ${shardIndex + 1}] Selected device $deviceId using port $driverHostPort with execution plan $executionPlan")
 
+        val agentSession = harmonyOsAgentReport?.sessionStarted(deviceId)
         return MaestroSessionManager.newSession(
             host = parent?.host,
             port = parent?.port,
@@ -489,44 +581,73 @@ class TestCommand : Callable<Int> {
             val maestro = session.maestro
             val device = session.device
 
-            val isReplicatingSingleFile = shardAll != null && effectiveShards > 1 && flowFiles.isSingleFile
-            val isMultipleFiles = flowFiles.isSingleFile.not()
-            val isAskingForReport = format != ReportFormat.NOOP
-            if (isMultipleFiles || isAskingForReport || isReplicatingSingleFile) {
-                if (continuous) {
-                    throw CommandLine.ParameterException(
-                        commandSpec.commandLine(),
-                        "Continuous mode is not supported when running multiple flows. (${flowFiles.joinToString(", ")})",
-                    )
+            val report = harmonyOsAgentReport
+            val driver = maestro.driver as? HarmonyOSDriver
+            val interactive = report?.interactive
+            if (interactive != null) driver?.previewFrame = interactive::preview
+            try {
+                report?.checkStop()
+                runOnSession(maestro, device, chunkPlans, shardIndex, debugOutputPath, deviceId, effectiveShards).also {
+                    report?.checkStop()
                 }
-                runBlocking {
-                    runMultipleFlows(
-                        maestro,
-                        device,
-                        chunkPlans,
-                        shardIndex,
-                        debugOutputPath,
-                        deviceId,
-                    )
+            } catch (error: CancellationException) {
+                if (interactive?.stopRequested != true) throw error
+                report.failed(error)
+                Triple(0, 1, null)
+            } finally {
+                if (interactive != null) driver?.previewFrame = null
+            }
+        }.also {
+            agentSession?.let { harmonyOsAgentReport?.sessionClosedNormally(it) }
+        }
+    }
+
+    private fun runOnSession(
+        maestro: Maestro,
+        device: Device?,
+        chunkPlans: List<ExecutionPlan>,
+        shardIndex: Int,
+        debugOutputPath: Path,
+        deviceId: String,
+        effectiveShards: Int,
+    ): Triple<Int?, Int?, TestExecutionSummary?> {
+        val isReplicatingSingleFile = shardAll != null && effectiveShards > 1 && flowFiles.isSingleFile
+        val isMultipleFiles = flowFiles.isSingleFile.not()
+        val isAskingForReport = format != ReportFormat.NOOP
+        return if (isMultipleFiles || isAskingForReport || isReplicatingSingleFile) {
+            if (continuous) {
+                throw CommandLine.ParameterException(
+                    commandSpec.commandLine(),
+                    "Continuous mode is not supported when running multiple flows. (${flowFiles.joinToString(", ")})",
+                )
+            }
+            runBlocking {
+                runMultipleFlows(
+                    maestro,
+                    device,
+                    chunkPlans,
+                    shardIndex,
+                    debugOutputPath,
+                    deviceId,
+                )
+            }
+        } else {
+            val flowFile = flowFiles.first()
+            if (continuous) {
+                if (!flattenDebugOutput) {
+                    TestDebugReporter.deleteOldFiles()
                 }
+                TestRunner.runContinuous(
+                    maestro,
+                    device,
+                    flowFile,
+                    env,
+                    analyze,
+                    authToken,
+                    deviceId,
+                )
             } else {
-                val flowFile = flowFiles.first()
-                if (continuous) {
-                    if (!flattenDebugOutput) {
-                        TestDebugReporter.deleteOldFiles()
-                    }
-                    TestRunner.runContinuous(
-                        maestro,
-                        device,
-                        flowFile,
-                        env,
-                        analyze,
-                        authToken,
-                        deviceId,
-                    )
-                } else {
-                    runSingleFlow(maestro, device, flowFile, debugOutputPath, deviceId)
-                }
+                runSingleFlow(maestro, device, flowFile, debugOutputPath, deviceId)
             }
         }
     }
@@ -573,6 +694,7 @@ class TestCommand : Callable<Int> {
             analyze = analyze,
             apiKey = authToken,
             deviceId = deviceId,
+            agentReport = harmonyOsAgentReport,
         )
         val duration = System.currentTimeMillis() - startTime
 
@@ -620,6 +742,7 @@ class TestCommand : Callable<Int> {
             reporter = ReporterFactory.buildReporter(format, testSuiteName),
             captureSteps = format == ReportFormat.HTML_DETAILED,
             captureFullArtifacts = analyze,
+            agentReport = harmonyOsAgentReport,
         ).runTestSuite(
             executionPlan = chunkPlans[shardIndex],
             env = env,

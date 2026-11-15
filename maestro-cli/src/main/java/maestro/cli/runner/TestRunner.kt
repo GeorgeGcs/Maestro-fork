@@ -8,6 +8,7 @@ import com.github.michaelbull.result.getOr
 import com.github.michaelbull.result.onFailure
 import kotlinx.coroutines.runBlocking
 import maestro.Maestro
+import maestro.cli.harmonyos.HarmonyOsCliAgentReport
 import maestro.MaestroException
 import maestro.device.Device
 import maestro.cli.report.FlowAIOutput
@@ -50,6 +51,7 @@ object TestRunner {
         analyze: Boolean = false,
         apiKey: String? = null,
         deviceId: String?,
+        agentReport: HarmonyOsCliAgentReport? = null,
     ): Int {
         val debugOutput = FlowDebugOutput()
         var aiOutput = FlowAIOutput(
@@ -82,6 +84,7 @@ object TestRunner {
                     analyze = analyze,
                     apiKey = apiKey,
                     artifactsDir = flowDir,
+                    agentObserver = agentReport?.flow(flowFile, flowDir, commands),
                 )
             }
         }

@@ -1,0 +1,6 @@
+appId: ${APP_ID}
+---
+- launchApp
+- assertVisible: never-present
+- tapOn:
+    id: open-form

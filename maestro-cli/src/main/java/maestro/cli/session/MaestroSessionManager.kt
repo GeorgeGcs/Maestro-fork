@@ -76,13 +76,21 @@ object MaestroSessionManager {
         executionPlan: WorkspaceExecutionPlanner.ExecutionPlan? = null,
         block: (MaestroSession) -> T,
     ): T {
+        val selectedPlatform = platform?.takeIf { it.isNotEmpty() }?.let { Platform.fromString(it) }
+        if (selectedPlatform == Platform.HARMONYOS) {
+            HarmonyOsSessionSupport.validateOptions(
+                host, port, driverHostPort, teamId, deviceIndex, isStudio, isHeadless, screenSize,
+            )
+            val target = HarmonyOsSessionSupport.selectDevice(deviceId)
+            return HarmonyOsSessionSupport.withSession(target, block = block)
+        }
         val selectedDevice = selectDevice(
             host = host,
             port = port,
             driverHostPort = driverHostPort,
             deviceId = deviceId,
             teamId = teamId,
-            platform = if(!platform.isNullOrEmpty()) Platform.fromString(platform) else null,
+            platform = selectedPlatform,
             deviceIndex = deviceIndex,
         )
         val sessionId = UUID.randomUUID().toString()
@@ -225,6 +233,7 @@ object MaestroSessionManager {
                     )
 
                     Platform.WEB -> pickWebDevice(isStudio, isHeadless, screenSize)
+                    Platform.HARMONYOS -> throw CliError("Select HarmonyOS using --platform harmonyos.")
                 },
                 device = selectedDevice.device,
             )

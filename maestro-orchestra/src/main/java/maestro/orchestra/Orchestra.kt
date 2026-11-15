@@ -36,6 +36,7 @@ import maestro.Maestro
 import maestro.DeviceConnectionException
 import maestro.MaestroException
 import maestro.device.AppCrashReport
+import maestro.device.Platform
 import maestro.Point
 import maestro.ScreenRecording
 import maestro.UiElement
@@ -52,6 +53,12 @@ import maestro.orchestra.debug.ArtifactsGenerator
 import maestro.orchestra.debug.BundleLayout
 import maestro.orchestra.debug.ArtifactCollector
 import maestro.orchestra.debug.CommandOutcome
+import maestro.orchestra.debug.ExecutionContext
+import maestro.orchestra.debug.ExecutionEvent
+import maestro.orchestra.debug.ExecutionTraceArtifacts
+import maestro.orchestra.debug.ExecutionTraceEnd
+import maestro.orchestra.debug.RetryExecutionEvent
+import maestro.orchestra.debug.RetryExecutionFrame
 import maestro.orchestra.debug.FlowDebugOutput
 import maestro.orchestra.debug.OrchestraListener
 import maestro.orchestra.debug.startScreenRecordingInto
@@ -83,6 +90,8 @@ import java.nio.file.Path
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.util.logging.Filter
+import java.util.Collections
+import java.util.UUID
 import kotlin.coroutines.coroutineContext
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -194,6 +203,19 @@ class Orchestra(
     // equality, so two identical commands would collide as map keys.
     private val commandStartTimes = mutableMapOf<Int, Long>()
 
+    private data class ExecutingCommand(
+        val command: MaestroCommand,
+        val context: ExecutionContext,
+        var terminal: Boolean = false,
+    )
+    private val executingCommands = ArrayDeque<ExecutingCommand>()
+    private val retryFrames = ArrayDeque<RetryExecutionFrame>()
+    private var traceSequence = 0L
+    private val traceStartedNanos = System.nanoTime()
+
+    private fun traceEvent() = ExecutionEvent(traceSequence++, System.nanoTime() - traceStartedNanos)
+    private fun <T> immutable(values: Collection<T>): List<T> = Collections.unmodifiableList(ArrayList(values))
+
     data class FlowResult(
         val success: Boolean,
         val debugOutput: FlowDebugOutput,
@@ -223,6 +245,23 @@ class Orchestra(
     }
 
     suspend fun runFlow(commands: List<MaestroCommand>): FlowResult {
+        var result: FlowResult? = null
+        var failure: Throwable? = null
+        try {
+            return runObservedFlow(commands).also { result = it }
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            val event = traceEvent()
+            val completionSequence = traceSequence++
+            val end = ExecutionTraceEnd(event, completionSequence, traceSequence,
+                commandSequenceCounter - 1, executingCommands.size, retryFrames.size, result?.success, failure)
+            dispatch("onExecutionTraceEnd") { it.onExecutionTraceEnd(end) }
+        }
+    }
+
+    private suspend fun runObservedFlow(commands: List<MaestroCommand>): FlowResult {
         val flowStartMs = System.currentTimeMillis()
         timeMsOfLastInteraction = System.currentTimeMillis()
 
@@ -233,9 +272,14 @@ class Orchestra(
 
         onFlowStart(commands)
         dispatch("onFlowStart") { it.onFlowStart() }
+        val traceArtifacts = ExecutionTraceArtifacts(artifactsGenerator::allocateFlowLog,
+            artifactsGenerator::refreshManifest, { artifactsGenerator.artifactManifest })
+        dispatch("onExecutionTraceReady") { it.onExecutionTraceReady(traceArtifacts) }
 
         var flowSuccess = false
         var exception: Throwable? = null
+        var bodyFailure: Throwable? = null
+        var completionFailure: Throwable? = null
         try {
             executeDefineVariablesCommands(commands, config)
             // After the variables: `appId: ${APP_ID}` only evaluates once they are defined.
@@ -248,6 +292,8 @@ class Orchestra(
                     commands = it,
                     config = config,
                     shouldReinitJsEngine = false,
+                    phase = "onFlowStart",
+                    onFailure = { bodyFailure = it },
                 )
             } ?: true
 
@@ -256,38 +302,51 @@ class Orchestra(
                     commands = filteredCommands,
                     config = config,
                     shouldReinitJsEngine = false,
-                ).also {
-                    // close existing screen recording, if left open.
-                    screenRecording?.close()
-                }
+                    onFailure = { bodyFailure = it },
+                )
             }
         } catch (e: CancellationException) {
+            exception = e
             throw e
         } catch (e: Throwable) {
             exception = e
         } finally {
-            val onCompleteSuccess = if (currentCoroutineContext().isActive) {
-                config?.onFlowComplete?.commands?.let {
-                    try {
-                        executeCommands(
-                            commands = it,
-                            config = config,
-                            shouldReinitJsEngine = false,
-                        )
-                    } catch (e: CancellationException) {
-                        // The whole run is being killed (timeout/cancel), not a hook failure — propagate.
-                        throw e
-                    } catch (e: Throwable) {
-                        // Must not escape this `finally`: that skips onFlowEnd, where device logs are
-                        // collected and manifest.json written, so a failed run would ship no logs.
-                        // Still rethrown below (Case 109), unless the flow body already failed — that wins.
-                        logger.warn("onFlowComplete hook failed: ${e.message}")
-                        if (exception == null) exception = e
-                        false
-                    }
-                } ?: true
-            } else {
-                true
+            // Finish the body recording before hooks, including when a command threw.
+            exception = closeFlowRecording(exception, bodyFailure)
+            val onCompleteSuccess = try {
+                if (exception !is CancellationException && currentCoroutineContext().isActive) {
+                    config?.onFlowComplete?.commands?.let {
+                        try {
+                            executeCommands(
+                                commands = it,
+                                config = config,
+                                shouldReinitJsEngine = false,
+                                phase = "onFlowComplete",
+                                onFailure = { completionFailure = it },
+                            )
+                        } catch (e: CancellationException) {
+                            // Cancellation takes precedence over flow and cleanup failures.
+                            exception?.takeIf { it !== e }?.let(e::addSuppressed)
+                            exception = e
+                            throw e
+                        } catch (e: Throwable) {
+                            // Keep collecting flow-end artifacts after a hook fails.
+                            logger.warn("onFlowComplete hook failed: ${e.message}")
+                            val primary = exception ?: bodyFailure
+                            if (primary == null) exception = e
+                            else {
+                                if (primary !== e) primary.addSuppressed(e)
+                                exception = primary
+                            }
+                            false
+                        }
+                    } ?: true
+                } else {
+                    true
+                }
+            } finally {
+                // A completion hook can start its own recording.
+                exception = closeFlowRecording(exception, bodyFailure ?: completionFailure)
             }
 
             jsEngine.close()
@@ -296,6 +355,8 @@ class Orchestra(
             artifactsGenerator.appCrashReport = crash // saved into the bundle with the other artifacts
 
             dispatch("onFlowEnd") { it.onFlowEnd() }
+
+            exception?.let { if (it is CancellationException) throw it }
 
             // A failed flow whose app crashed failed because of the crash. This is the one place the
             // crash is raised; the failing command's own error rides along.
@@ -314,10 +375,28 @@ class Orchestra(
         }
     }
 
+    private fun closeFlowRecording(failure: Throwable?, handledFailure: Throwable? = null): Throwable? {
+        val recording = screenRecording ?: return failure
+        screenRecording = null
+        try {
+            recording.close()
+        } catch (closeError: Throwable) {
+            // FAIL callbacks normally return a failed result. Promote their original
+            // error only when recording cleanup also fails and must be thrown.
+            val primary = failure ?: handledFailure ?: return closeError
+            if (primary !== closeError) primary.addSuppressed(closeError)
+            return primary
+        }
+        return failure
+    }
+
     private suspend fun executeCommands(
         commands: List<MaestroCommand>,
         config: MaestroConfig? = null,
         shouldReinitJsEngine: Boolean = true,
+        phase: String = "body",
+        scopeOwner: Int? = executingCommands.lastOrNull()?.context?.executionSequence,
+        onFailure: (Throwable) -> Unit = {},
     ): Boolean {
         if (shouldReinitJsEngine) {
             initJsEngine(config)
@@ -333,11 +412,7 @@ class Orchestra(
                 // Check for pause before executing each command
                 flowController.waitIfPaused()
 
-                onCommandStart(index, command)
-                val sequenceNumber = commandSequenceCounter++
-                val startedAt = System.currentTimeMillis()
-                commandStartTimes[sequenceNumber] = startedAt
-                dispatch("onCommandStart") { it.onCommandStart(command, sequenceNumber, subflowDepth) }
+                observeCommand(index, command, phase, scopeOwner) { sequenceNumber ->
 
                 jsEngine.onLogMessage { msg ->
                     val metadata = getMetadata(command)
@@ -396,11 +471,15 @@ class Orchestra(
                     dispatchFinished(command, CommandOutcome.Failed(e), sequenceNumber)
                     val errorResolution = onCommandFailed(index, command, e)
                     when (errorResolution) {
-                        ErrorResolution.FAIL -> return false
+                        ErrorResolution.FAIL -> {
+                            onFailure(e)
+                            return false
+                        }
                         ErrorResolution.CONTINUE -> {} // Do nothing
                     }
                 } finally {
                     insights.unregisterListener(callback)
+                }
                 }
             }
         return true
@@ -989,29 +1068,60 @@ class Orchestra(
 
     private suspend fun retryCommand(command: RetryCommand, config: MaestroConfig?): Boolean {
         val maxRetries = (command.maxRetries?.toIntOrNull() ?: 1).coerceAtMost(MAX_RETRIES_ALLOWED)
+        val invocationId = UUID.randomUUID().toString()
+        val owner = executingCommands.last().context.executionSequence
+        val parents = immutable(retryFrames)
+        fun emit(kind: String, tryNo: Int? = null, outcome: String? = null, error: Throwable? = null) {
+            val event = RetryExecutionEvent(traceEvent(), kind, invocationId, owner, parents,
+                maxRetries, command.optional, tryNo, outcome, error)
+            dispatch("onRetryExecution") { it.onRetryExecution(event) }
+        }
+        emit("retryBlockStarted")
 
         // Retry is intended for flaky test-level failures — element not found, assertion
         // failures, etc. — which all surface as MaestroException. Anything else (driver
         // transport failures, JS evaluation bugs, CancellationException) propagates naturally.
-        var attempt = 0
-        while (attempt <= maxRetries) {
-            try {
-                return runSubFlow(command.commands, config, command.config)
-            } catch (exception: MaestroException) {
-                if (attempt == maxRetries) {
-                    logger.error("Max retries ($maxRetries) reached. Commands failed.", exception)
-                    throw exception
+        var blockOutcome = "completed"
+        var blockError: Throwable? = null
+        try {
+            var attempt = 0
+            while (attempt <= maxRetries) {
+                val tryNo = attempt + 1
+                try {
+                    retryFrames.addLast(RetryExecutionFrame(invocationId, owner, tryNo))
+                    emit("retryTryStarted", tryNo)
+                    try {
+                        return runSubFlow(command.commands, config, command.config).also {
+                            emit("retryTryFinished", tryNo, "completed")
+                        }
+                    } catch (error: Throwable) {
+                        emit("retryTryFinished", tryNo,
+                            if (error is MaestroException) "failed" else "interrupted", error)
+                        throw error
+                    } finally {
+                        retryFrames.removeLast()
+                    }
+                } catch (exception: MaestroException) {
+                    if (attempt == maxRetries) {
+                        logger.error("Max retries ($maxRetries) reached. Commands failed.", exception)
+                        throw exception
+                    }
+                    emit("retryScheduled", tryNo + 1)
+                    val message =
+                        "Retrying the commands due to an error: ${exception.message} while execution (Attempt ${attempt + 1})"
+                    logger.error("Attempt ${attempt + 1} failed for retry command", exception)
+                    insights.report(Insight(message = message, Insight.Level.WARNING))
                 }
-
-                val message =
-                    "Retrying the commands due to an error: ${exception.message} while execution (Attempt ${attempt + 1})"
-                logger.error("Attempt ${attempt + 1} failed for retry command", exception)
-                insights.report(Insight(message = message, Insight.Level.WARNING))
+                attempt++
             }
-            attempt++
+            return false
+        } catch (error: Throwable) {
+            blockOutcome = if (error is MaestroException) "failed" else "interrupted"
+            blockError = error
+            throw error
+        } finally {
+            emit("retryBlockFinished", outcome = blockOutcome, error = blockError)
         }
-
-        return false
     }
 
     private fun updateMetadata(rawCommand: MaestroCommand, metadata: CommandMetadata) {
@@ -1042,8 +1152,45 @@ class Orchestra(
     ) {
         val finishedAt = System.currentTimeMillis()
         val startedAt = commandStartTimes.remove(sequenceNumber) ?: finishedAt
-        dispatch("onCommandFinished") {
-            it.onCommandFinished(command, outcome, startedAt, finishedAt)
+        val frame = executingCommands.last { it.context.executionSequence == sequenceNumber }
+        frame.terminal = true
+        val event = traceEvent()
+        dispatch("onCommandExecutionFinished") {
+            it.onCommandExecutionFinished(command, frame.context, outcome, startedAt, finishedAt, event)
+        }
+    }
+
+    private suspend inline fun <T> observeCommand(
+        index: Int, command: MaestroCommand, phase: String, scopeOwner: Int?, block: (Int) -> T,
+    ): T {
+        // This strict registration stays before device dispatch and listener isolation.
+        onCommandStart(index, command)
+        val sequence = commandSequenceCounter++
+        val context = ExecutionContext(sequence, executingCommands.lastOrNull()?.context?.executionSequence,
+            immutable(retryFrames), scopeOwner, phase, immutable(executingCommands.filter {
+                it.command.asCommand()?.optional == true || it.command.elementSelector()?.optional == true
+            }.map { it.context.executionSequence }))
+        val frame = ExecutingCommand(command, context)
+        executingCommands.addLast(frame)
+        val startedAt = System.currentTimeMillis()
+        commandStartTimes[sequence] = startedAt
+        try {
+            val event = traceEvent()
+            dispatch("onCommandExecutionStarted") { it.onCommandExecutionStarted(command, context, subflowDepth, event) }
+            return block(sequence)
+        } catch (error: Throwable) {
+            if (!frame.terminal) {
+                frame.terminal = true
+                commandStartTimes.remove(sequence)
+                val event = traceEvent()
+                val finishedAt = System.currentTimeMillis()
+                dispatch("onCommandExecutionInterrupted") {
+                    it.onCommandExecutionInterrupted(command, context, error, startedAt, finishedAt, event)
+                }
+            }
+            throw error
+        } finally {
+            executingCommands.removeLast()
         }
     }
 
@@ -1144,7 +1291,10 @@ class Orchestra(
         return true
     }
 
-    private suspend fun executeSubflowCommands(commands: List<MaestroCommand>, config: MaestroConfig?): Boolean {
+    private suspend fun executeSubflowCommands(
+        commands: List<MaestroCommand>, config: MaestroConfig?, phase: String = "body",
+        scopeOwner: Int? = executingCommands.lastOrNull()?.context?.executionSequence,
+    ): Boolean {
         jsEngine.enterScope()
         subflowDepth++
 
@@ -1152,13 +1302,8 @@ class Orchestra(
             commands
                 .mapIndexed { index, command ->
                     yield()
-                    onCommandStart(index, command)
-                    val sequenceNumber = commandSequenceCounter++
-                    val startedAt = System.currentTimeMillis()
-                    commandStartTimes[sequenceNumber] = startedAt
-                    dispatch("onCommandStart") { it.onCommandStart(command, sequenceNumber, subflowDepth) }
-
-                    return@mapIndexed try {
+                    observeCommand(index, command, phase, scopeOwner) { sequenceNumber ->
+                    try {
                         try {
                             // Script evaluation is part of running the command, so keep it inside the
                             // guarded block: a parse error (e.g. a bad numeric field) then reports a
@@ -1205,6 +1350,7 @@ class Orchestra(
                             }
                         }
                     }
+                    }
                 }
                 .any { it }
         } finally {
@@ -1229,7 +1375,7 @@ class Orchestra(
             val onCompleteSuccess: Boolean
             try {
                 val onStartSuccess = subflowConfig?.onFlowStart?.commands?.let {
-                    executeSubflowCommands(it, config)
+                    executeSubflowCommands(it, config, phase = "onFlowStart")
                 } ?: true
 
                 if (onStartSuccess) {
@@ -1242,7 +1388,7 @@ class Orchestra(
             } finally {
                 onCompleteSuccess = if (currentCoroutineContext().isActive) {
                     subflowConfig?.onFlowComplete?.commands?.let {
-                        executeSubflowCommands(it, config)
+                        executeSubflowCommands(it, config, phase = "onFlowComplete")
                     } ?: true
                 } else {
                     true
@@ -1337,9 +1483,12 @@ class Orchestra(
             maestro.clearAppState(command.appId)
         }
 
-        // For testing convenience, default to allow all on app launch
-        val permissions = command.permissions ?: mapOf("all" to "allow")
-        maestro.setPermissions(command.appId, permissions)
+        // HarmonyOS uses the app's current grants; there is no equivalent of grant-all.
+        // Explicit permission commands must still reach the driver and fail if unsupported.
+        if (command.permissions != null || maestro.cachedDeviceInfo.platform != Platform.HARMONYOS) {
+            val permissions = command.permissions ?: mapOf("all" to "allow")
+            maestro.setPermissions(command.appId, permissions)
+        }
 
         maestro.launchApp(
             appId = command.appId,
@@ -1871,7 +2020,8 @@ class Orchestra(
             executeCommands(
                 commands = it,
                 config = config,
-                shouldReinitJsEngine = false
+                shouldReinitJsEngine = false,
+                phase = "setup",
             )
         }
     }

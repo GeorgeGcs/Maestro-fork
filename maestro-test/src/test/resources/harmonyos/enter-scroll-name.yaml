@@ -1,0 +1,7 @@
+appId: ${APP_ID}
+---
+- tapOn:
+    id: scroll-name-input
+    retryTapIfNoChange: false
+- inputText: ${NAME}
+- assertVisible: ${NAME}

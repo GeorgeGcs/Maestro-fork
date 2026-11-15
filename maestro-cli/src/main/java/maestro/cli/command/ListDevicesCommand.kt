@@ -4,6 +4,7 @@ import maestro.cli.App
 import maestro.cli.CliError
 import maestro.cli.ShowHelpMixin
 import maestro.cli.report.TestDebugReporter
+import maestro.cli.session.HarmonyOsSessionSupport
 import maestro.cli.util.PrintUtils
 import maestro.cli.view.bold
 import maestro.cli.view.cyan
@@ -11,6 +12,8 @@ import maestro.cli.view.faint
 import maestro.device.Device
 import maestro.device.DeviceService
 import maestro.device.Platform
+import maestro.harmonyos.hdc.HdcClient
+import maestro.harmonyos.hdc.HdcException
 import picocli.CommandLine
 import java.util.concurrent.Callable
 
@@ -28,15 +31,31 @@ class ListDevicesCommand : Callable<Int> {
 
     @CommandLine.Option(
         names = ["--platform"],
-        description = ["Filter by platform: android, ios, web"],
+        description = ["Filter by platform: android, ios, web, harmonyos"],
     )
     private var platform: String? = null
 
     override fun call(): Int {
         TestDebugReporter.install(null, printToConsole = parent?.verbose == true)
 
-        val platformFilter = platform?.let { input ->
+        val platformFilter = (platform ?: parent?.platform)?.let { input ->
             Platform.fromString(input)
+        }
+
+        if (platformFilter == Platform.HARMONYOS) {
+            HarmonyOsSessionSupport.validateOptions(
+                host = parent?.host,
+                port = parent?.port,
+                driverHostPort = parent?.driverHostPort,
+            )
+            val targets = try {
+                HdcClient().listDevices()
+            } catch (error: HdcException) {
+                throw CliError(error.message ?: "Unable to list HarmonyOS devices.").also { it.initCause(error) }
+            }
+            println("HarmonyOS (HDC)".bold())
+            if (targets.isEmpty()) println("No HDC devices found") else targets.forEach { println(row(it)) }
+            return 0
         }
 
         println("Showing local devices. Use 'maestro list-cloud-devices' to list devices available on Maestro Cloud.".faint())

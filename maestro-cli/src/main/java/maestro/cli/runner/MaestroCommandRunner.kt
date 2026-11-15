@@ -20,6 +20,7 @@
 package maestro.cli.runner
 
 import maestro.Maestro
+import maestro.cli.harmonyos.HarmonyOsCliAgentReport
 import maestro.MaestroException
 import maestro.device.Device
 import maestro.cli.report.SingleScreenFlowAIOutput
@@ -63,7 +64,8 @@ object MaestroCommandRunner {
         aiOutput: FlowAIOutput,
         apiKey: String? = null,
         analyze: Boolean = false,
-        artifactsDir: Path? = null
+        artifactsDir: Path? = null,
+        agentObserver: HarmonyOsCliAgentReport.FlowObserver? = null,
     ): Orchestra.FlowResult {
         val config = YamlCommandReader.getConfig(commands)
         val onFlowComplete = config?.onFlowComplete
@@ -103,11 +105,13 @@ object MaestroCommandRunner {
         val orchestra = Orchestra(
             maestro = maestro,
             artifactsDir = artifactsDir,
+            listeners = listOfNotNull(agentObserver),
             // --analyze feeds the AI from the bundle: capture a per-step screenshot
             // for every command so the analysis has the full visual trail.
             captureFullArtifacts = analyze,
             insights = CliInsights,
-            onCommandStart = { _, command ->
+            onCommandStart = { index, command ->
+                agentObserver?.starting(command, index)
                 logger.info("${command.description()} RUNNING")
                 commandStatuses[command] = CommandStatus.RUNNING
                 debugOutput.commands[command] = CommandDebugMetadata(
@@ -189,7 +193,12 @@ object MaestroCommandRunner {
             apiKey = apiKey,    
         )
 
-        return orchestra.runFlow(commands)
+        return try {
+            orchestra.runFlow(commands).let { agentObserver?.finished(it) ?: it }
+        } catch (error: Throwable) {
+            agentObserver?.aborted(error)
+            throw error
+        }
     }
 
     private fun toCommandStates(

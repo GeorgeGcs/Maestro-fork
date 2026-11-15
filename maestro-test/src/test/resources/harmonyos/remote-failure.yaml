@@ -1,0 +1,7 @@
+appId: ${APP_ID}
+---
+- launchApp
+- tapOn:
+    id: open-form
+    retryTapIfNoChange: false
+- inputText: must-not-run

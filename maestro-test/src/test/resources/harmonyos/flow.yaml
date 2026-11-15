@@ -1,0 +1,26 @@
+# Synthetic device scenario. It is not evidence from a HarmonyOS phone.
+appId: ${APP_ID}
+---
+- launchApp
+- assertVisible: 欢迎
+- tapOn:
+    id: open-form
+    retryTapIfNoChange: false
+- assertVisible: 姓名
+- runFlow:
+    when:
+      visible: 姓名
+    file: enter-name.yaml
+    env:
+      NAME: ${INPUT_TEXT}
+- runFlow:
+    when:
+      visible: 不存在的页面
+    commands:
+      - inputText: should-not-run
+- tapOn:
+    text: 提交
+    retryTapIfNoChange: false
+- assertVisible: 已提交
+- assertVisible: ${INPUT_TEXT}
+- takeScreenshot: flow-complete

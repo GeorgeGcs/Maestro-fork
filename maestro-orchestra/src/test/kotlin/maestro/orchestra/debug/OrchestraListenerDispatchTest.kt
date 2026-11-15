@@ -65,6 +65,9 @@ class OrchestraListenerDispatchTest {
             widthGrid = 100,
             heightGrid = 200,
         )
+        // Match Maestro's ownership of the supplied sink, including on Windows where
+        // an open file prevents the temporary artifact directory from being removed.
+        coEvery { takeScreenshot(any<Sink>(), any(), any()) } answers { firstArg<Sink>().close() }
         pressKeyThrows?.let { coEvery { pressKey(any(), any()) } throws it }
         openLinkThrows?.let { coEvery { openLink(any(), any(), any(), any()) } throws it }
     }

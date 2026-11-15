@@ -1,0 +1,16 @@
+appId: ${APP_ID}
+---
+- launchApp
+- tapOn:
+    id: open-scroll-form
+    retryTapIfNoChange: false
+- scrollUntilVisible:
+    element:
+      id: missing-scroll-target
+    direction: DOWN
+    timeout: 50
+    speed: 80
+- tapOn:
+    id: scroll-name-input
+    retryTapIfNoChange: false
+- inputText: must-not-run

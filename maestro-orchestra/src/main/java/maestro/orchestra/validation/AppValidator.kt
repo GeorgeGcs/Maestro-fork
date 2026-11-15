@@ -86,6 +86,7 @@ class AppValidator(
             }
             Platform.ANDROID -> return
             Platform.WEB -> return
+            Platform.HARMONYOS -> throw AppValidationException.UnsupportedPlatform("HarmonyOS package installation")
         }
     }
 }

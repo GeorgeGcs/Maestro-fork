@@ -122,6 +122,18 @@ internal class ArtifactsGenerator(
         )
     }
 
+    /** Listener outputs share the same bundle and manifest as core artifacts. */
+    fun allocateFlowLog(path: String, format: ArtifactFormat): File? =
+        collector?.allocate(ArtifactKind.MAESTRO_LOG, format, path)
+
+    /** A CLI observer may seal its logs after runFlow returns or throws. */
+    fun refreshManifest() {
+        val collector = collector ?: return
+        val directory = artifactsDir ?: return
+        artifactManifest = collector.manifest()
+        TestOutputWriter.saveManifest(directory, artifactManifest)
+    }
+
     /**
      * The running assertScreenshot's diff, named from the step like its screenshot and hierarchy, so
      * two failing assertions never share a file. Null when no bundle is produced.

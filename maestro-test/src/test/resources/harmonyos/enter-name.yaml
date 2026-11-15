@@ -1,0 +1,7 @@
+appId: ${APP_ID}
+---
+- tapOn:
+    id: name-input
+    retryTapIfNoChange: false
+- inputText: ${NAME}
+- assertVisible: ${NAME}

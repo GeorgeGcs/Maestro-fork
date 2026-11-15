@@ -36,6 +36,7 @@ sealed interface DeviceLocale {
         Platform.ANDROID -> AndroidLocale.fromString(localeString)
         Platform.IOS -> IosLocale.fromString(localeString)
         Platform.WEB -> WebLocale.fromString(localeString)
+        Platform.HARMONYOS -> throw LocaleValidationException("Changing the HarmonyOS device locale is not supported")
       }
     }
 
@@ -59,6 +60,7 @@ sealed interface DeviceLocale {
         Platform.ANDROID -> AndroidLocale.all
         Platform.IOS -> IosLocale.entries
         Platform.WEB -> WebLocale.entries
+        Platform.HARMONYOS -> emptyList()
       }
     }
 
@@ -70,6 +72,7 @@ sealed interface DeviceLocale {
         Platform.ANDROID -> AndroidLocale.allCodes
         Platform.IOS -> IosLocale.allCodes
         Platform.WEB -> WebLocale.allCodes
+        Platform.HARMONYOS -> emptySet()
       }
     }
 
@@ -82,6 +85,7 @@ sealed interface DeviceLocale {
         Platform.ANDROID -> AndroidLocale.find(languageCode, countryCode)
         Platform.IOS -> IosLocale.find(languageCode, countryCode)
         Platform.WEB -> WebLocale.find(languageCode, countryCode)
+        Platform.HARMONYOS -> null
       }
     }
 
@@ -91,6 +95,7 @@ sealed interface DeviceLocale {
         Platform.ANDROID -> AndroidLocale.fromString("en_US")
         Platform.IOS -> IosLocale.fromString("en_US")
         Platform.WEB -> WebLocale.fromString("en_US")
+        Platform.HARMONYOS -> throw LocaleValidationException("HarmonyOS uses the connected device's current locale")
       }
     }
 

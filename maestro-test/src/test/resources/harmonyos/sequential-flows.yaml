@@ -1,0 +1,5 @@
+# Sequential sub-flows in one session; CLI workspace batching is tested separately.
+appId: ${APP_ID}
+---
+- runFlow: flow.yaml
+- runFlow: scroll-flow.yaml

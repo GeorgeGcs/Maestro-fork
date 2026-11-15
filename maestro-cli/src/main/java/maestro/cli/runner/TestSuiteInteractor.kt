@@ -1,6 +1,7 @@
 package maestro.cli.runner
 
 import maestro.Maestro
+import maestro.cli.harmonyos.HarmonyOsCliAgentReport
 import maestro.cli.CliError
 import maestro.device.Device
 import maestro.cli.model.FlowStatus
@@ -43,6 +44,7 @@ class TestSuiteInteractor(
     private val shardIndex: Int? = null,
     private val captureSteps: Boolean = false,
     private val captureFullArtifacts: Boolean = false,
+    private val agentReport: HarmonyOsCliAgentReport? = null,
 ) {
 
     private val logger = LoggerFactory.getLogger(TestSuiteInteractor::class.java)
@@ -160,6 +162,7 @@ class TestSuiteInteractor(
         maestro: Maestro,
         debugOutputPath: Path,
     ): Pair<TestExecutionSummary.FlowResult, FlowAIOutput> {
+        agentReport?.checkStop()
         // TODO(bartekpacia): merge TestExecutionSummary with AI suggestions
         //  (i.e. consider them also part of the test output)
         //  See #1973
@@ -182,6 +185,7 @@ class TestSuiteInteractor(
 
         // Per-flow folder ArtifactsGenerator writes the bundle into (see BundleLayout).
         val flowDir = TestDebugReporter.createFlowDir(debugOutputPath, flowName, shardIndex)
+        val agentObserver = agentReport?.flow(flowFile, flowDir, commands)
 
         var debugOutput = FlowDebugOutput()
         val flowStartTime = System.currentTimeMillis()
@@ -191,7 +195,8 @@ class TestSuiteInteractor(
                     maestro = maestro,
                     artifactsDir = flowDir,
                     captureFullArtifacts = captureFullArtifacts,
-                    listeners = listOf(CliConsoleListener(shardPrefix)),
+                    listeners = listOfNotNull(CliConsoleListener(shardPrefix), agentObserver),
+                    onCommandStart = { index, command -> agentObserver?.starting(command, index) },
                     onCommandFailed = { _, _, _ -> Orchestra.ErrorResolution.FAIL },
                     onCommandGeneratedOutput = { command, defects, screenshot ->
                         logger.info("${shardPrefix}${command.description()} generated output")
@@ -205,10 +210,13 @@ class TestSuiteInteractor(
                     },
                 )
 
-                val result = orchestra.runFlow(commands)
+                val execution = orchestra.runFlow(commands)
+                val result = agentObserver?.finished(execution) ?: execution
                 flowStatus = if (result.success) FlowStatus.SUCCESS else FlowStatus.ERROR
                 debugOutput = result.debugOutput
             } catch (e: Exception) {
+                agentObserver?.aborted(e)
+                if (agentReport?.interactive?.stopRequested == true && e is java.util.concurrent.CancellationException) throw e
                 logger.error("${shardPrefix}Failed to complete flow", e)
                 flowStatus = FlowStatus.ERROR
                 errorMessage = ErrorViewUtils.exceptionToMessage(e)

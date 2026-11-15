@@ -16,6 +16,9 @@ object PickDeviceInteractor {
         platform: Platform? = null,
         deviceIndex: Int? = null,
     ): Device.Connected {
+        if (platform == Platform.HARMONYOS) {
+            throw CliError("Use --platform harmonyos with the HDC session; Android/iOS device selection does not support HarmonyOS.")
+        }
         if (deviceId != null) {
             return DeviceService.listConnectedDevices()
                 .find {
@@ -32,6 +35,7 @@ object PickDeviceInteractor {
                         Platform.ANDROID -> PrintUtils.message("Launching Android emulator...")
                         Platform.IOS -> PrintUtils.message("Launching iOS simulator...")
                         Platform.WEB -> PrintUtils.message("Launching ${result.description}")
+                        Platform.HARMONYOS -> throw CliError("Connect and authorize a HarmonyOS device through HDC; automatic device launch is not supported.")
                     }
 
                     // Snapshot already-connected devices so the freshly launched one can be told

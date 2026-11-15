@@ -117,6 +117,7 @@ class StartDeviceCommand : Callable<Int> {
                 locale = deviceLocale?.let { WebLocale.fromString(it) } ?: default.locale,
             )
         }
+        Platform.HARMONYOS -> throw CliError("start-device does not create HarmonyOS devices. Connect and authorize a device through HDC.")
     }
 
     override fun call(): Int {

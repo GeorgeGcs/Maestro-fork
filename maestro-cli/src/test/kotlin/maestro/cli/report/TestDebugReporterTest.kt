@@ -5,6 +5,8 @@ import io.mockk.every
 import io.mockk.mockkObject
 import io.mockk.unmockkObject
 import maestro.cli.util.EnvUtils
+import maestro.debuglog.LogConfig
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -26,6 +28,13 @@ class TestDebugReporterTest {
         // updateTestOutputDir clears testOutputDir and debugOutputPath;
         // install() called in each test resets the remaining fields.
         TestDebugReporter.updateTestOutputDir(null)
+    }
+
+    @AfterEach
+    fun releaseLogFiles() {
+        // install() replaces the logging configuration. Close its file appender before
+        // JUnit removes tempDir, including on Windows where open files cannot be deleted.
+        LogConfig.configure(printToConsole = false)
     }
 
     @Test

@@ -108,9 +108,14 @@ class PrintHierarchyCommand : Runnable {
         val startTime = System.currentTimeMillis()
         Analytics.trackEvent(PrintHierarchyStartedEvent(platform = platform))
 
+        val isHarmonyOs = parent?.platform?.let { Platform.fromString(it) } == Platform.HARMONYOS
+        if (isHarmonyOs && androidWebViewHierarchy != null) {
+            throw CliError("--android-webview-hierarchy is not supported for HarmonyOS.")
+        }
         val effectiveDeviceId: String? = when {
             parent?.deviceId != null -> parent.deviceId
             deviceIndex != null -> null
+            isHarmonyOs -> null
             else -> {
                 val platformFilter = parent?.platform?.let { Platform.fromString(it) }
                 val connectedDevices = DeviceService.listConnectedDevices().withPlatform(platformFilter)
@@ -119,7 +124,7 @@ class PrintHierarchyCommand : Runnable {
                     1 -> connectedDevices[0].instanceId
                     else -> {
                         val hint = if (platformFilter == null) {
-                            " You can also narrow by platform using --platform <android|ios>."
+                            " You can also narrow by platform using --platform <android|ios|harmonyos>."
                         } else ""
                         throw CliError("Multiple devices connected. Please specify a device using --device <id>.$hint")
                     }

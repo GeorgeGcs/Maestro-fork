@@ -1,0 +1,31 @@
+# Synthetic scrolling page: the same input id moves after each swipe.
+appId: ${APP_ID}
+---
+- launchApp
+- tapOn:
+    id: open-scroll-form
+    retryTapIfNoChange: false
+- assertVisible: 滚动表单
+- scrollUntilVisible:
+    element:
+      id: scroll-name-input
+    direction: DOWN
+    visibilityPercentage: 100
+    centerElement: false
+    timeout: 5000
+    speed: 80
+- runFlow:
+    when:
+      platform: harmonyos
+      visible:
+        id: scroll-name-input
+    file: enter-scroll-name.yaml
+    env:
+      NAME: ${INPUT_TEXT}
+- runFlow:
+    when:
+      notVisible: ${INPUT_TEXT}
+    commands:
+      - inputText: should-not-run
+- assertVisible: ${INPUT_TEXT}
+- takeScreenshot: scroll-complete

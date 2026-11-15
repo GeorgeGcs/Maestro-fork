@@ -1,0 +1,53 @@
+{
+  "attributes": {
+    "id": "",
+    "text": "",
+    "bounds": "[0,0][1080,2400]",
+    "enabled": "",
+    "clickable": ""
+  },
+  "children": [
+    {
+      "attributes": {
+        "id": "main",
+        "key": "main",
+        "type": "Column",
+        "bounds": "[0,80][1080,2320]",
+        "enabled": "true",
+        "bundleName": "org.example.uitest",
+        "hostWindowId": "7"
+      },
+      "children": [
+        {
+          "attributes": {
+            "id": "submit",
+            "key": "submit",
+            "accessibilityId": "1001",
+            "type": "Button",
+            "text": "提交订单",
+            "bounds": "[24,120][400,200]",
+            "clickable": "true",
+            "enabled": "true",
+            "focused": "false",
+            "checked": "false",
+            "selected": "false",
+            "visible": "true"
+          },
+          "children": []
+        },
+        {
+          "attributes": {
+            "id": "name",
+            "type": "TextInput",
+            "text": "",
+            "hint": "请输入姓名",
+            "accessibilityText": "收件人姓名",
+            "bounds": "[24,220][600,300]",
+            "focused": "true"
+          },
+          "children": []
+        }
+      ]
+    }
+  ]
+}

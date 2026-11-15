@@ -175,6 +175,8 @@ object DeviceService {
                 }
             }
 
+            Platform.HARMONYOS -> throw DeviceError("Launching HarmonyOS emulators is not supported. Connect a device using HDC.")
+
             Platform.WEB -> {
                 PrintUtils.message("Launching Web...")
                 CdpWebDriver(isStudio = false, isHeadless = false, screenSize = null).open()
@@ -486,6 +488,8 @@ object DeviceService {
      */
     fun isDeviceConnected(deviceName: String, platform: Platform): Device.Connected? {
         return when (platform) {
+            // This API looks up managed emulators, not HDC devices.
+            Platform.HARMONYOS -> null
             Platform.IOS -> listIOSDevices()
                 .filterIsInstance<Device.Connected>()
                 .find { it.description.contains(deviceName, ignoreCase = true) }
@@ -515,6 +519,7 @@ object DeviceService {
      * @return true if ios simulator or android emulator is available to launch
      */
     fun isDeviceAvailableToLaunch(deviceName: String, platform: Platform): Device.AvailableForLaunch? {
+        if (platform == Platform.HARMONYOS) return null
         return if (platform == Platform.IOS) {
             listIOSDevices()
                 .filterIsInstance<Device.AvailableForLaunch>()

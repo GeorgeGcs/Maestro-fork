@@ -1,12 +1,16 @@
 package maestro.debuglog
 
 import org.apache.logging.log4j.core.appender.FileAppender
+import org.apache.logging.log4j.core.Filter
 import org.apache.logging.log4j.core.config.Configurator
 import org.apache.logging.log4j.core.config.builder.api.ConfigurationBuilder
 import org.apache.logging.log4j.core.config.builder.api.ConfigurationBuilderFactory
 import org.apache.logging.log4j.core.config.builder.impl.BuiltConfiguration
 
 object LogConfig {
+
+    // HDC diagnostics belong in file captures, including when a JSON command enables --verbose.
+    internal const val HDC_DIAGNOSTIC_MARKER = "MAESTRO_HDC_DIAGNOSTICS"
 
     private const val DEFAULT_FILE_LOG_PATTERN = "%d{HH:mm:ss.SSS} [%5level] %logger.%method: %msg%n"
     private const val DEFAULT_CONSOLE_LOG_PATTERN = "%highlight{[%5level]} %msg%n"
@@ -51,6 +55,10 @@ object LogConfig {
         val consoleLayout = builder.newLayout("PatternLayout")
         consoleLayout.addAttribute("pattern", CONSOLE_LOG_PATTERN)
         consoleAppender.add(consoleLayout)
+        consoleAppender.add(
+            builder.newFilter("MarkerFilter", Filter.Result.DENY, Filter.Result.NEUTRAL)
+                .addAttribute("marker", HDC_DIAGNOSTIC_MARKER)
+        )
 
         builder.add(consoleAppender)
 

@@ -12,6 +12,28 @@ interface OrchestraListener {
 
     fun onFlowStart() = Unit
 
+    fun onExecutionTraceReady(artifacts: ExecutionTraceArtifacts) = Unit
+
+    /** Default forwarding preserves the old listener contract, once per event. */
+    fun onCommandExecutionStarted(
+        cmd: MaestroCommand, context: ExecutionContext, depth: Int, event: ExecutionEvent,
+    ) = onCommandStart(cmd, context.executionSequence, depth)
+
+    fun onCommandExecutionFinished(
+        cmd: MaestroCommand, context: ExecutionContext, outcome: CommandOutcome,
+        startedAt: Long, finishedAt: Long, event: ExecutionEvent,
+    ) = onCommandFinished(cmd, outcome, startedAt, finishedAt)
+
+    /** A propagated cancellation/connection failure has no fabricated CommandOutcome. */
+    fun onCommandExecutionInterrupted(
+        cmd: MaestroCommand, context: ExecutionContext, error: Throwable,
+        startedAt: Long, finishedAt: Long, event: ExecutionEvent,
+    ) = Unit
+
+    fun onRetryExecution(event: RetryExecutionEvent) = Unit
+
+    fun onExecutionTraceEnd(end: ExecutionTraceEnd) = Unit
+
     /**
      * @param sequenceNumber monotonic across the whole flow, nested commands included.
      * @param depth nesting level: 0 at the flow top, +1 per runFlow/repeat/retry.

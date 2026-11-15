@@ -29,6 +29,9 @@ import maestro.cli.command.CheckSyntaxCommand
 import maestro.cli.command.CloudCommand
 import maestro.cli.command.DownloadSamplesCommand
 import maestro.cli.command.DriverCommand
+import maestro.cli.command.HarmonyOsBridgeCommand
+import maestro.cli.command.HarmonyOsRecoveryCommand
+import maestro.cli.command.HarmonyOsCleanupRecoveryCommand
 import maestro.cli.command.ListCloudDevicesCommand
 import maestro.cli.command.ListDevicesCommand
 import maestro.cli.command.LoginCommand
@@ -41,6 +44,7 @@ import maestro.cli.command.StartDeviceCommand
 import maestro.cli.command.StudioCommand
 import maestro.cli.command.TestCommand
 import maestro.cli.insights.TestAnalysisManager
+import maestro.cli.harmonyos.HarmonyOsBridgeStdout
 import maestro.cli.mcp.claimMcpStdout
 import maestro.cli.update.Updates
 import maestro.cli.util.ChangeLogUtils
@@ -76,6 +80,9 @@ import kotlin.system.exitProcess
         CheckSyntaxCommand::class,
         DriverCommand::class,
         McpCommand::class,
+        HarmonyOsBridgeCommand::class,
+        HarmonyOsRecoveryCommand::class,
+        HarmonyOsCleanupRecoveryCommand::class,
     ]
 )
 class App {
@@ -88,7 +95,7 @@ class App {
     @Option(names = ["-v", "--version"], versionHelp = true, description = ["Display CLI version"])
     var requestedVersion: Boolean? = false
 
-    @Option(names = ["-p", "--platform"], description = ["(Optional) Select a platform to run on"])
+    @Option(names = ["-p", "--platform"], description = ["(Optional) Select android, ios, web or harmonyos"])
     var platform: String? = null
 
     @Option(names = ["--host"], hidden = true)
@@ -123,6 +130,7 @@ fun main(args: Array<String>) {
     // kotlin-logging's first-load message will otherwise land on the MCP JSON-RPC
     // channel and break the handshake for strict clients like Claude Desktop.
     if (args.firstOrNull() == "mcp") claimMcpStdout()
+    if (args.contains("harmonyos-bridge")) HarmonyOsBridgeStdout.claim()
 
     // Establish a consistent logging baseline for every command before any init
     // logging fires. Without this, commands that don't call TestDebugReporter.install()
