@@ -28,7 +28,12 @@ class HarmonyOSWindowStateTest {
             HarmonyOSWindowState("$header\n$app\nFocus window: 12\nFocus window: 20").focusedPid()
         }
         assertThrows(HarmonyOSWindowFormatException::class.java) {
-            HarmonyOSWindowState("$header\n$app\nFocus window: 999").focusedPid()
+            HarmonyOSWindowState("$header\n$app\nOther 0 999 12 1 1 0 104 0 [ 0 0 2800 1840 ]\nFocus window: 12").focusedPid()
         }
+    }
+
+    @Test fun `a transitional focus without a window row is not ready yet`() {
+        assertThat(HarmonyOSWindowState("$header\n$app\nFocus window: 999").focusedPid()).isNull()
+        assertThat(HarmonyOSWindowState("$header\n$app\nFocus window: -1").focusedPid()).isNull()
     }
 }

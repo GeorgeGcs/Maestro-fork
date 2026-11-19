@@ -82,7 +82,7 @@ class HdcHarmonyOSDevice(
     override fun hasAppFocus(appId: String, timeout: Duration): Boolean {
         val deadline = System.nanoTime() + timeout.toNanos()
         val windows = diagnostic(listOf("hidumper", "-s", "WindowManagerService", "-a", "-a"), timeout)
-        val pid = HarmonyOSWindowState(windows).focusedPid()
+        val pid = HarmonyOSWindowState(windows).focusedPid() ?: return false
         val processes = diagnostic(listOf("ps", "-A", "-o", "PID,NAME"), remainingBudget(deadline, timeout))
         return processes.lineSequence().map { it.trim().split(Regex("\\s+"), limit = 2) }
             .any { it.size == 2 && it[0] == pid && (it[1] == appId || it[1].startsWith("$appId:")) }

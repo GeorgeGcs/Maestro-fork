@@ -16,11 +16,14 @@ internal class HarmonyOSWindowState(private val text: String) {
             else columns.drop(1).zip(values.takeLast(columns.size - 1)).toMap()
         }.toList()
 
-    fun focusedPid(): String {
-        val focus = Regex("(?m)^\\s*Focus window:\\s*(\\d+)\\s*$").findAll(text).map { it.groupValues[1] }.toList()
+    fun focusedPid(): String? {
+        val focus = Regex("(?m)^\\s*Focus window:\\s*(-?\\d+)\\s*$").findAll(text).map { it.groupValues[1] }.toList()
         if (focus.size != 1) throw HarmonyOSWindowFormatException("WindowManagerService returned no unique focused window.")
+        if (focus.single() == "-1") return null
         val idColumn = if ("WinId" in columns) "WinId" else "WindowId"
         val owners = rows.filter { it[idColumn] == focus.single() }.mapNotNull { it["Pid"] }.distinct()
+        // Focus and window rows can change between samples while an Ability starts.
+        if (owners.isEmpty()) return null
         return owners.singleOrNull()?.takeIf { it.toLongOrNull() != null }
             ?: throw HarmonyOSWindowFormatException("The focused window has no unique process owner.")
     }
