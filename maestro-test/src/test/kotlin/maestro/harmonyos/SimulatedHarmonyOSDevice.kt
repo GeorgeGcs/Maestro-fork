@@ -35,6 +35,7 @@ internal class SimulatedHarmonyOSDevice(
     val remoteFiles = mutableMapOf<String, ByteArray>()
 
     private var inputFocused = false
+    private var foregroundApp: String? = null
     private var enteredName = ""
     private var scrollPosition = 0
     private val mapper = ObjectMapper()
@@ -74,9 +75,22 @@ internal class SimulatedHarmonyOSDevice(
     }
 
     private fun execute(arguments: List<String>): HdcCommandResult = when {
+        arguments == listOf("hidumper", "-s", "DisplayManagerService", "-a", "-a") -> hostSuccess(
+            "[SCREEN SESSION]\nDisplayId: 0\nactiveModes<id, W, H, RS>: 0, $WIDTH, $HEIGHT, 60\nRotation: 0\n",
+        )
+        arguments == listOf("hidumper", "-s", "WindowManagerService", "-a", "-a") -> hostSuccess(
+            "WindowName DisplayId Pid WinId Type ZOrd [ x y w h ]\n" + if (foregroundApp != null) {
+                "Fixture 0 123 12 1 102 [ 0 0 $WIDTH $HEIGHT ]\nFocus window: 12\n"
+            } else "Focus window: -1\n",
+        )
+        arguments == listOf("ps", "-A", "-o", "PID,NAME") ->
+            hostSuccess("PID NAME\n" + (foregroundApp?.let { "123 $it\n" } ?: ""))
+        arguments == listOf("date", "+%s%3N") -> hostSuccess(System.currentTimeMillis().toString())
+        arguments.take(2) == listOf("hisysevent", "-l") -> hostSuccess()
         arguments.take(2) == listOf("aa", "force-stop") -> {
             check(arguments.size == 3)
             stoppedApps += arguments[2]
+            if (foregroundApp == arguments[2]) foregroundApp = null
             state = State.HOME
             inputFocused = false
             enteredName = ""
@@ -87,6 +101,7 @@ internal class SimulatedHarmonyOSDevice(
             check(arguments.size == 6 && arguments[2] == "-b" && arguments[4] == "-a")
             check(arguments[5] == "EntryAbility")
             launchedApps += arguments[3]
+            foregroundApp = arguments[3]
             state = State.HOME
             inputFocused = false
             enteredName = ""
