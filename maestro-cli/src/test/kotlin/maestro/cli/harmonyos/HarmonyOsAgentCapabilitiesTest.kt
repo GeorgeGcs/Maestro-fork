@@ -75,6 +75,17 @@ class HarmonyOsAgentCapabilitiesTest {
         assertTrue(screen["checks"].any { it["name"].asText() == "screenUnlocked" && it["status"].asText() == "unknown" })
     }
 
+    @Test fun `keyboard dismissal is advertised for flows without claiming device readiness`() {
+        val probe = Probe()
+        val result = mapper.valueToTree<com.fasterxml.jackson.databind.JsonNode>(HarmonyOsAgentCapabilities(probe).describe())
+        val command = result["commands"].single { it["name"].asText() == "hideKeyboard" }
+        assertEquals("supported", command["implementation"].asText())
+        val check = preflight(probe, """{"deviceId":"test-target","appId":"com.example.demo","commands":["hideKeyboard"]}""")
+        assertEquals("unknown", check["readiness"].asText())
+        assertFalse(check["checks"].any { it["status"].asText() == "failed" })
+        assertTrue(probe.shell.all { it.first() in setOf("which", "bm") })
+    }
+
     @Test fun `invalid requests are rejected before device discovery`() {
         val probe = Probe()
         listOf(
