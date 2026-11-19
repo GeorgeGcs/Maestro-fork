@@ -2,6 +2,7 @@ package maestro.orchestra.debug
 
 import maestro.orchestra.ArtifactFormat
 import maestro.orchestra.ArtifactManifest
+import maestro.harmonyos.driver.HarmonyOSFlowFaults
 import java.io.File
 
 /** Values are snapshots of the executor, never a listener-maintained execution stack. */
@@ -16,7 +17,13 @@ data class ExecutionContext(
     val optionalAncestorSequences: List<Int>,
 )
 
-data class ExecutionEvent(val sequence: Long, val elapsedNanos: Long)
+data class ElementWaitObservation(val condition: String, val budgetMs: Long, val elapsedMs: Long, val satisfied: Boolean)
+
+data class ExecutionEvent(
+    val sequence: Long,
+    val elapsedNanos: Long,
+    val elementWaits: List<ElementWaitObservation> = emptyList(),
+)
 
 data class RetryExecutionEvent(
     val event: ExecutionEvent,
@@ -41,6 +48,14 @@ data class ExecutionTraceEnd(
     val activeRetries: Int,
     val success: Boolean?,
     val error: Throwable?,
+    val faultInspection: HarmonyOSFaultInspection? = null,
+)
+
+data class HarmonyOSFaultInspection(
+    val appId: String,
+    val state: String,
+    val faults: HarmonyOSFlowFaults? = null,
+    val traceEpochMs: Long? = null,
 )
 
 /** Allocates only flow-level log outputs in the generator-owned bundle. */

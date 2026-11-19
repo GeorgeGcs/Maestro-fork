@@ -2,6 +2,7 @@ package maestro.harmonyos.hdc
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.JsonNode
 import java.nio.channels.FileChannel
@@ -80,6 +81,8 @@ class HarmonyOSRecoveryJournal private constructor(
         var returned: Boolean = false,
         var stopped: Boolean = false,
     )
+    data class LayoutForward(val port: Int, val confirmed: Boolean)
+
     data class State(
         val version: Int = 1,
         val deviceId: String,
@@ -91,7 +94,24 @@ class HarmonyOSRecoveryJournal private constructor(
         val operations: MutableList<Operation> = mutableListOf(),
         val temporaryFiles: MutableSet<String> = linkedSetOf(),
         val hostCalls: MutableList<HostCall> = mutableListOf(),
+        @get:JsonInclude(JsonInclude.Include.NON_NULL)
+        var layoutForward: LayoutForward? = null,
     )
+
+    @Synchronized internal fun registerLayoutForward(port: Int) {
+        requireDispatch()
+        require(port in 1024..65535)
+        check(state.layoutForward == null) { "A UITest forward was already registered for this session." }
+        state.layoutForward = LayoutForward(port, confirmed = false)
+        persist()
+    }
+
+    @Synchronized internal fun confirmLayoutForward(port: Int) {
+        requireDispatch()
+        check(state.layoutForward == LayoutForward(port, confirmed = false)) { "The UITest forward was not registered." }
+        state.layoutForward = LayoutForward(port, confirmed = true)
+        persist()
+    }
 
     @Synchronized fun seal() {
         ensureOpen()
@@ -108,6 +128,7 @@ class HarmonyOSRecoveryJournal private constructor(
         ensureOpen()
         check(state.sealed && activeCalls == 0 && !persistenceUnconfirmed) { "Maintenance requires a sealed, durable, idle journal." }
         check(state.hostCalls.all { it.stopped }) { "Maintenance requires confirmed native termination." }
+        check(state.layoutForward == null) { "Resolve the UITest forward through normal recovery before maintenance." }
         check(recordings == null &&
             Files.notExists(path.resolveSibling("recording-resources.json"), LinkOption.NOFOLLOW_LINKS)) {
             "Maintenance does not handle recording resources."
@@ -149,6 +170,33 @@ class HarmonyOSRecoveryJournal private constructor(
     @Synchronized internal fun ownsTemporaryFile(remote: String): Boolean {
         ensureOpen()
         return remote in state.temporaryFiles
+    }
+
+    /** An out-of-shell mutation has no remote completion marker to recover after an interrupted call. */
+    internal fun <T> externalMutation(arguments: List<String>, dispatch: () -> T): T {
+        val operation = Operation(UUID.randomUUID().toString(), UUID.randomUUID().toString(),
+            hash(mapper.writeValueAsBytes(arguments)), recoverable = false)
+        val previousRootRemoved = synchronized(this) {
+            requireDispatch()
+            val previous = state.rootRemoved
+            state.rootRemoved = false
+            state.operations += operation
+            try { persist() } catch (failure: Throwable) {
+                rollbackOperation(operation, previous, failure)
+                throw failure
+            }
+            previous
+        }
+        val result = dispatch()
+        synchronized(this) {
+            operation.completed = true
+            operation.markerRemoved = true
+            if (previousRootRemoved && state.operations.all { it.markerRemoved } && state.temporaryFiles.isEmpty()) {
+                state.rootRemoved = true
+            }
+            persist()
+        }
+        return result
     }
 
     internal fun shell(arguments: List<String>, recoverable: Boolean, allowSealed: Boolean = false, execute: (List<String>) -> HdcCommandResult): HdcCommandResult {
@@ -273,12 +321,12 @@ class HarmonyOSRecoveryJournal private constructor(
 
     /** Requires the caller's exclusive device lease. Does not issue input, launch, or retry commands. */
     @Synchronized fun recover(hdc: HdcClient, timeout: Duration = Duration.ofSeconds(10), cleanupResources: Boolean = true,
-                              hostProcessGrace: Duration = Duration.ZERO): RecoveryReport {
+                              hostProcessGrace: Duration = Duration.ZERO, cleanupForward: Boolean = cleanupResources): RecoveryReport {
         ensureOpen()
         require(timeout > Duration.ZERO && timeout <= Duration.ofMinutes(1))
         require(!hostProcessGrace.isNegative && hostProcessGrace <= Duration.ofSeconds(10))
         if (!state.sealed || activeCalls != 0) return report()
-        if (state.operations.isEmpty() && state.rootRemoved && state.hostCalls.all { it.stopped }) {
+        if (state.operations.isEmpty() && state.rootRemoved && state.hostCalls.all { it.stopped } && state.layoutForward == null) {
             // Allocating a path is local bookkeeping; no remote directory is created before shell dispatch.
             if (cleanupResources) { state.temporaryFiles.clear(); persist() }
             return report()
@@ -324,6 +372,16 @@ class HarmonyOSRecoveryJournal private constructor(
             refreshHostCalls()
         }
         if (state.hostCalls.any { !it.stopped }) return report()
+        if (cleanupForward) state.layoutForward?.let { forward ->
+            try {
+                hdc.recoverUitestLayoutForward(this, forward.port, forward.confirmed, ::remaining)
+                state.layoutForward = null
+                persist()
+            } catch (error: Exception) {
+                if (error is InterruptedException) Thread.currentThread().interrupt()
+                return report(listOf(RecoveryIssue("UITEST_FORWARD_CLEANUP_UNCONFIRMED", "The registered UITest forward could not be confirmed released.")))
+            }
+        }
         try {
             for (operation in state.operations.filterNot { it.completed }) {
                 if (!operation.recoverable) {
@@ -427,8 +485,8 @@ class HarmonyOSRecoveryJournal private constructor(
         if (activeCalls != 0) issues += RecoveryIssue("HOST_CALL_ACTIVE", "A local invocation is still active.")
         if (state.hostCalls.any { !it.stopped }) issues += RecoveryIssue("HOST_PROCESS_UNCONFIRMED", "A native invocation has no confirmed termination.")
         if (state.operations.any { !it.completed }) issues += RecoveryIssue("REMOTE_COMPLETION_UNCONFIRMED", "One or more remote commands have no completion proof.")
-        if (state.temporaryFiles.isNotEmpty() || state.operations.any { !it.markerRemoved } || !state.rootRemoved) {
-            issues += RecoveryIssue("OWNED_RESOURCES_REMAIN", "Owned remote resources have not all been confirmed removed.")
+        if (state.layoutForward != null || state.temporaryFiles.isNotEmpty() || state.operations.any { !it.markerRemoved } || !state.rootRemoved) {
+            issues += RecoveryIssue("OWNED_RESOURCES_REMAIN", "Owned session resources have not all been confirmed removed.")
         }
         return RecoveryReport(if (issues.isEmpty()) "complete" else "unknown", state.operations.size,
             state.operations.count { !it.completed }, state.temporaryFiles.size, issues.distinct())
@@ -539,7 +597,13 @@ class HarmonyOSRecoveryJournal private constructor(
             }
             fun texts(node: JsonNode, vararg names: String) { require(names.all { node[it].isTextual }) { "Invalid recovery text." } }
             fun booleans(node: JsonNode, vararg names: String) { require(names.all { node[it].isBoolean }) { "Invalid recovery flag." } }
-            fields(tree, setOf("version", "deviceId", "ownerId", "generation", "remoteRoot", "sealed", "rootRemoved", "operations", "temporaryFiles", "hostCalls"))
+            val required = setOf("version", "deviceId", "ownerId", "generation", "remoteRoot", "sealed", "rootRemoved", "operations", "temporaryFiles", "hostCalls")
+            fields(tree, if (tree.has("layoutForward")) required + "layoutForward" else required)
+            tree.get("layoutForward")?.let { forward ->
+                fields(forward, setOf("port", "confirmed"))
+                require(forward["port"].isIntegralNumber && forward["port"].canConvertToInt() && forward["port"].intValue() in 1024..65535)
+                booleans(forward, "confirmed")
+            }
             require(tree["version"].isIntegralNumber && tree["version"].canConvertToInt())
             texts(tree, "deviceId", "ownerId", "generation", "remoteRoot")
             booleans(tree, "sealed", "rootRemoved")

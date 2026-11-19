@@ -137,6 +137,33 @@ class ArtifactsGeneratorTest {
     }
 
     @Test
+    fun `step evidence keeps both frames for each execution without starting a recording`() {
+        val maestro = mockMaestro()
+        val gen = ArtifactsGenerator(artifactsDir = tempDir, maestro = maestro, captureStepEvidence = true)
+        val reused = MaestroCommand(scrollCommand = ScrollCommand())
+
+        gen.onFlowStart()
+        gen.onCommandStart(reused, 0)
+        gen.onCommandFinished(reused, CommandOutcome.Failed(RuntimeException("first try")), 100L, 200L)
+        gen.onCommandStart(reused, 1)
+        gen.onCommandFinished(reused, CommandOutcome.Completed, 300L, 400L)
+        gen.onFlowEnd()
+
+        val attempts = gen.debugOutput.executedSteps.map { step -> step.artifacts.filter { it.type == ArtifactKind.SCREENSHOT } }
+        assertThat(attempts).containsExactly(
+            listOf(CommandArtifact(ArtifactKind.SCREENSHOT, "screenshots/step-001-scroll-before.png", "before"),
+                CommandArtifact(ArtifactKind.SCREENSHOT, "screenshots/step-001-scroll.png", "failure")),
+            listOf(CommandArtifact(ArtifactKind.SCREENSHOT, "screenshots/step-002-scroll-before.png", "before"),
+                CommandArtifact(ArtifactKind.SCREENSHOT, "screenshots/step-002-scroll.png", "after")),
+        ).inOrder()
+        val commandsJson = Files.readString(tempDir.resolve("commands.json"))
+        assertThat(commandsJson).contains("\"phase\" : \"before\"")
+        assertThat(commandsJson).contains("\"phase\" : \"failure\"")
+        assertThat(commandsJson).contains("\"phase\" : \"after\"")
+        assertThat(gen.artifactManifest.entries.none { it.kind == ArtifactKind.SCREEN_RECORDING }).isTrue()
+    }
+
+    @Test
     fun `screenshot failure does not block hierarchy capture`() {
         // Screenshot throws; hierarchy file still lands.
         val maestro: Maestro = mockk(relaxed = true) {

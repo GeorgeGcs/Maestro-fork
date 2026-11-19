@@ -9,11 +9,16 @@ import maestro.ScreenRecording
 import maestro.SwipeDirection
 import maestro.TreeNode
 import maestro.ViewHierarchy
+import maestro.filterOutOfBounds
 import maestro.device.DeviceOrientation
 import maestro.device.Platform
+import maestro.harmonyos.driver.HarmonyOSBundleMetadata
 import maestro.harmonyos.driver.HarmonyOSCommandException
 import maestro.harmonyos.driver.HarmonyOSDevice
 import maestro.harmonyos.driver.HarmonyOSDriverConfig
+import maestro.harmonyos.driver.HarmonyOSFlowFaults
+import maestro.harmonyos.driver.HarmonyOSHostFrameRecording
+import maestro.harmonyos.driver.HarmonyOSScreenFrame
 import maestro.harmonyos.driver.HdcHarmonyOSDevice
 import maestro.harmonyos.driver.requireIdentifier
 import maestro.harmonyos.hdc.HdcClient
@@ -24,11 +29,19 @@ import okio.Sink
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.net.URI
+import java.net.URISyntaxException
 import java.time.Duration
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantLock
 import javax.imageio.ImageIO
 import javax.imageio.stream.MemoryCacheImageInputStream
 import kotlin.math.hypot
 import kotlin.math.roundToInt
+import kotlin.concurrent.withLock
 
 /** Host driver for devices exposing the OpenHarmony UITest shell commands. */
 class HarmonyOSDriver(
@@ -41,15 +54,32 @@ class HarmonyOSDriver(
         config: HarmonyOSDriverConfig = HarmonyOSDriverConfig(),
     ) : this(HdcHarmonyOSDevice(deviceId, hdc, config.layoutRpcPort.also {
         require(it == null || deviceId == config.layoutRpcDevice) { "Layout RPC target differs from the selected device" }
-    }), config)
+    }, config.arkWebPort, config.arkWebBundle, config.arkWebTarget, config.automaticLayoutRpc), config)
 
     @Volatile private var opened = false
     private var recording: ScreenRecording? = null
     private var recordingFailure: Throwable? = null
-    var previewFrame: ((ByteArray) -> Unit)? = null
-    private var queryFailure: HdcTimeoutException? = null
+    private class FramePreview(val wantsFrame: () -> Boolean, val publish: (ByteArray) -> Unit)
+    @Volatile private var preview: FramePreview? = null
+    @Volatile private var hostRecording: HarmonyOSHostFrameRecording? = null
+    @Volatile private var frameSampler: ScheduledExecutorService? = null
+    private val pendingFrame = AtomicReference<HarmonyOSScreenFrame?>()
+    private val transport = ReentrantLock(true)
+    @Volatile private var lastForegroundIo = 0L
+    @Volatile private var queryFailure: HdcTimeoutException? = null
+    private var useDisplaySize = false
+    private var lastDeviceInfo: DeviceInfo? = null
+    private data class HierarchySample(val root: TreeNode, val finishedAt: Long)
+    private var lastHierarchy: HierarchySample? = null
 
     override fun name(): String = "HarmonyOS"
+
+    val strictFaultDiagnostics: Boolean get() = config.strictFaultDiagnostics
+
+    fun flowFaults(appId: String, startMs: Long, endMs: Long): HarmonyOSFlowFaults? = transport.withLock {
+        if (!opened || queryFailure != null) null else
+            device.flowFaults(appId, startMs, endMs, minOf(config.commandTimeout, Duration.ofSeconds(6)))
+    }
 
     @Synchronized
     override fun open() {
@@ -58,7 +88,8 @@ class HarmonyOSDriver(
         checkInterrupted()
         device.connect()
         try {
-            capture(config.commandTimeout)
+            val image = capture(config.commandTimeout).image
+            useDisplaySize = query { device.displaySize(config.commandTimeout) } == (image.width to image.height)
             hierarchy()
             opened = true
         } catch (error: Throwable) {
@@ -70,34 +101,55 @@ class HarmonyOSDriver(
     @Synchronized
     override fun close() {
         opened = false
+        lastHierarchy = null
+        lastDeviceInfo = null
         val current = recording
         recording = null
+        preview = null
+        val sampler = frameSampler
+        frameSampler = null
         try {
-            current?.close()
-        } catch (error: Throwable) {
-            rememberRecordingFailure(error)
+            stopFrameSampler(sampler)
         } finally {
-            device.disconnect()
+            try {
+                current?.close()
+            } catch (error: Throwable) {
+                rememberRecordingFailure(error)
+            } finally {
+                pendingFrame.set(null)
+                device.disconnect()
+            }
         }
         recordingFailure?.let { throw it }
     }
 
     override fun deviceInfo(): DeviceInfo {
         requireOpen()
-        val image = capture(config.commandTimeout).image
         // UITest coordinates and bounds are physical pixels, including system bars.
-        return DeviceInfo(Platform.HARMONYOS, image.width, image.height, image.width, image.height)
+        val size = if (useDisplaySize) {
+            query { device.displaySize(config.commandTimeout) }
+        } else null
+        val (width, height) = size ?: capture(config.commandTimeout).image.let { it.width to it.height }
+        return DeviceInfo(Platform.HARMONYOS, width, height, width, height).also { lastDeviceInfo = it }
     }
+
+    private var activeAppId: String? = null
 
     override fun launchApp(appId: String, launchArguments: Map<String, Any>) {
         requireOpen()
         requireIdentifier(appId, "Bundle name")
-        val ability = config.abilityName ?: throw IllegalStateException(
-            "Set MAESTRO_HARMONYOS_ABILITY (or HarmonyOSDriverConfig.abilityName) to the app's launch ability",
-        )
+        val discovered = if (config.abilityName == null) {
+            val output = query { device.execute(listOf("bm", "dump", "-n", appId), config.commandTimeout) }
+            val bundle = HarmonyOSBundleMetadata.parse(output, appId)
+            bundle?.let { HarmonyOSBundleMetadata.launchTarget(it, config.moduleName) }
+                ?: throw IllegalStateException(
+                    "Could not determine a unique main Ability for $appId. Set MAESTRO_HARMONYOS_ABILITY to choose one explicitly.",
+                )
+        } else null
+        val ability = config.abilityName ?: checkNotNull(discovered).abilityName
         // https://github.com/openharmony/docs/blob/master/en/application-dev/tools/aa-tool.md
         val arguments = mutableListOf("aa", "start", "-b", appId, "-a", ability)
-        config.moduleName?.let { arguments += listOf("-m", it) }
+        (config.moduleName ?: discovered?.moduleName)?.let { arguments += listOf("-m", it) }
         launchArguments.forEach { (key, value) ->
             requireIdentifier(key, "Launch argument name")
             arguments += when (value) {
@@ -117,12 +169,45 @@ class HarmonyOSDriver(
             }
         }
         aa(arguments, "start ability successfully.")
+        val launchWait = minOf(config.commandTimeout, Duration.ofSeconds(12))
+        val firstWait = if (launchArguments.isEmpty()) launchWait.dividedBy(2) else launchWait
+        if (awaitAppFocus(appId, firstWait)) { activeAppId = appId; return }
+        if (launchArguments.isEmpty()) {
+            // Activation can be acknowledged before the window manager finishes switching.
+            aa(arguments, "start ability successfully.")
+            if (awaitAppFocus(appId, launchWait.minus(firstWait))) { activeAppId = appId; return }
+        }
+        throw HarmonyOSCommandException("Application $appId did not acquire window focus after aa start.", "", "")
+    }
+
+    private fun awaitAppFocus(appId: String, timeout: Duration): Boolean {
+        val deadline = System.nanoTime() + timeout.toNanos()
+        var previousSampleFocused = false
+        while (System.nanoTime() < deadline) {
+            val remaining = Duration.ofNanos(deadline - System.nanoTime())
+            if (remaining <= Duration.ZERO) return false
+            val focused = query {
+                try {
+                    device.hasAppFocus(appId, minOf(Duration.ofSeconds(2), remaining))
+                } catch (error: maestro.harmonyos.driver.HarmonyOSWindowFormatException) {
+                    throw error
+                } catch (_: HdcException) {
+                    checkInterrupted()
+                    false
+                }
+            }
+            if (focused && previousSampleFocused) return true
+            previousSampleFocused = focused
+            if (!pause(deadline)) return false
+        }
+        return false
     }
 
     override fun stopApp(appId: String) {
         requireOpen()
         requireIdentifier(appId, "Bundle name")
         aa(listOf("aa", "force-stop", appId), "force stop process successfully.")
+        if (activeAppId == appId) activeAppId = null
     }
 
     override fun killApp(appId: String) = stopApp(appId)
@@ -157,13 +242,16 @@ class HarmonyOSDriver(
     override fun contentDescriptor(excludeKeyboardElements: Boolean): TreeNode {
         requireOpen()
         if (excludeKeyboardElements) unsupported("excluding keyboard elements from the hierarchy")
-        return hierarchy()
+        return hierarchy().also { lastHierarchy = HierarchySample(it, System.nanoTime()) }
     }
 
     override fun scrollVertical() = swipe(SwipeDirection.UP, 400)
 
     override fun swipe(start: Point, end: Point, durationMs: Long) {
-        val info = deviceInfo()
+        swipe(start, end, durationMs, deviceInfo())
+    }
+
+    private fun swipe(start: Point, end: Point, durationMs: Long, info: DeviceInfo) {
         validatePoint(start, info)
         validatePoint(end, info)
         require(durationMs > 0) { "Swipe duration must be positive" }
@@ -183,7 +271,7 @@ class HarmonyOSDriver(
             SwipeDirection.LEFT -> Point(info.widthGrid * 4 / 5, center.y) to Point(info.widthGrid / 5, center.y)
             SwipeDirection.RIGHT -> Point(info.widthGrid / 5, center.y) to Point(info.widthGrid * 4 / 5, center.y)
         }
-        swipe(start, end, durationMs)
+        swipe(start, end, durationMs, info)
     }
 
     override fun swipe(elementPoint: Point, direction: SwipeDirection, durationMs: Long) {
@@ -194,7 +282,7 @@ class HarmonyOSDriver(
             SwipeDirection.LEFT -> Point(maxOf(1, elementPoint.x - info.widthGrid * 3 / 5), elementPoint.y)
             SwipeDirection.RIGHT -> Point(minOf(info.widthGrid - 1, elementPoint.x + info.widthGrid * 3 / 5), elementPoint.y)
         }
-        swipe(elementPoint, end, durationMs)
+        swipe(elementPoint, end, durationMs, info)
     }
 
     override fun backPress() = pressKey(KeyCode.BACK)
@@ -241,9 +329,17 @@ class HarmonyOSDriver(
     override fun waitForAppToSettle(initialHierarchy: ViewHierarchy?, appId: String?, timeoutMs: Int?): ViewHierarchy? {
         requireOpen()
         val deadline = deadline(timeoutMs?.toLong() ?: config.settleTimeout.toMillis())
-        var previous: TreeNode? = null
+        val sample = lastHierarchy
+        lastHierarchy = null
+        val info = lastDeviceInfo
+        var previous = sample?.root?.takeIf { root ->
+            initialHierarchy != null && info != null &&
+                System.nanoTime() - sample.finishedAt <= config.pollInterval.toNanos().coerceAtLeast(250_000_000) &&
+                (root.filterOutOfBounds(info.widthGrid, info.heightGrid) ?: root) == initialHierarchy.root
+        }
         var previousSampleNanos = 0L
-        // Require two fresh samples. A caller's snapshot can predate the last input event.
+        // Reuse a matching pre-action sample from this driver. Input invalidates the sample.
+        // Post-action settling still needs two fresh samples.
         while (true) {
             if (!canSample(deadline, previousSampleNanos)) return null
             val started = System.nanoTime()
@@ -263,19 +359,76 @@ class HarmonyOSDriver(
         if (permissions.isNotEmpty()) unsupported("setting app permissions")
     }
 
-    override fun clearAppState(appId: String): Unit = unsupported("clearState")
+    override fun clearAppState(appId: String) {
+        requireOpen()
+        requireIdentifier(appId, "Bundle name")
+        val metadata = query { device.execute(listOf("bm", "dump", "-n", appId), config.commandTimeout) }
+        when (HarmonyOSBundleMetadata.dataClearSupport(HarmonyOSBundleMetadata.parse(metadata, appId))) {
+            HarmonyOSBundleMetadata.DataClearSupport.SUPPORTED -> Unit
+            HarmonyOSBundleMetadata.DataClearSupport.UNSUPPORTED -> throw UnsupportedOperationException(
+                "clearState requires a regular application whose user data can be cleared. Atomic services are unsupported.",
+            )
+            HarmonyOSBundleMetadata.DataClearSupport.UNKNOWN -> throw IllegalStateException(
+                "The installed bundle did not confirm its application type and data-clear support for clearState.",
+            )
+        }
+        lastHierarchy = null
+        // Close the app before removal so a running process cannot save its previous state again.
+        stopApp(appId)
+        val output = query { device.execute(listOf("bm", "clean", "-d", "-n", appId), config.commandTimeout) }
+        if (output.lineSequence().none { it.trim() == "clean bundle data files successfully." }) {
+            throw HarmonyOSCommandException("bm did not confirm that application data was cleared", output, "")
+        }
+    }
     override fun clearKeychain(): Unit = unsupported("clearKeychain")
-    override fun isKeyboardVisible(): Boolean = unsupported("keyboard visibility detection")
-    override fun hideKeyboard(): Unit = unsupported("hideKeyboard; use an app control to dismiss the keyboard")
-    override fun openLink(link: String, appId: String?, autoVerify: Boolean, browser: Boolean): Unit = unsupported("openLink")
+    override fun isKeyboardVisible(): Boolean {
+        requireOpen()
+        return query { device.keyboardVisible(config.commandTimeout) }
+    }
+    override fun hideKeyboard() {
+        requireOpen()
+        if (!isKeyboardVisible()) return
+        val appId = activeAppId ?: throw IllegalStateException("Launch the target app before dismissing its keyboard.")
+        if (!query { device.hasAppFocus(appId, config.commandTimeout) }) {
+            throw HarmonyOSCommandException("Cannot dismiss a keyboard outside the target application $appId.", "", "")
+        }
+        input("keyEvent", "Back")
+        val end = System.nanoTime() + config.commandTimeout.toNanos()
+        while (isKeyboardVisible()) {
+            if (!pause(end)) throw HarmonyOSCommandException("The keyboard remained visible after Back.", "", "")
+        }
+        if (!query { device.hasAppFocus(appId, config.commandTimeout) }) {
+            throw HarmonyOSCommandException("The keyboard closed but $appId did not retain window focus.", "", "")
+        }
+    }
+    override fun openLink(link: String, appId: String?, autoVerify: Boolean, browser: Boolean) {
+        requireOpen()
+        if (autoVerify) unsupported("openLink autoVerify")
+        val uri = try { URI(link) } catch (_: URISyntaxException) {
+            throw IllegalArgumentException("openLink requires a valid absolute URI.")
+        }
+        require(uri.isAbsolute && link.length <= 4096 && link.none(Char::isISOControl)) {
+            "openLink requires a valid absolute URI of at most 4096 characters."
+        }
+        val web = uri.scheme.equals("http", true) || uri.scheme.equals("https", true)
+        require(!browser || web) { "openLink browser mode requires an HTTP or HTTPS URL." }
+        if (web) require(uri.host != null) { "openLink HTTP and HTTPS URLs require a host." }
+        val arguments = listOf("aa", "start") + (if (web) listOf("-A", "ohos.want.action.viewData") else emptyList()) +
+            listOf("-U", uri.toASCIIString())
+        lastDeviceInfo = null
+        aa(arguments, "start ability successfully.")
+    }
     @Synchronized
     override fun startScreenRecording(out: Sink): ScreenRecording {
         requireOpen()
-        if (!config.enableScreenRecording) unsupported("screen recording without explicit enableScreenRecording configuration")
+        if (!config.enableScreenRecording && config.hostRecordingFfmpeg == null) unsupported("screen recording without an enabled backend")
         recordingFailure?.let { throw it }
         check(recording == null) { "This driver already owns a recording" }
+        val host = config.hostRecordingFfmpeg?.let {
+            HarmonyOSHostFrameRecording(out, it, config.recordingMaxDuration, config.recordingMaxBytes, config.recordingStopTimeout)
+        }
         try {
-            val current = device.startScreenRecording(out, config)
+            val current = host ?: transport.withLock { device.startScreenRecording(out, config) }
             val handle = object : ScreenRecording {
                 override val startedAt = current.startedAt
                 private var closed = false
@@ -283,10 +436,12 @@ class HarmonyOSDriver(
                     synchronized(this@HarmonyOSDriver) {
                         if (closed) return
                         closed = true
+                        if (host != null) hostRecording = null
                         try {
-                            current.close()
+                            if (host != null) current.close() else transport.withLock { current.close() }
                         } catch (error: Throwable) {
-                            rememberRecordingFailure(error)
+                            // The host encoder owns no system recording or remote media.
+                            if (host == null) rememberRecordingFailure(error)
                             throw error
                         } finally {
                             if (recording === this) recording = null
@@ -295,11 +450,79 @@ class HarmonyOSDriver(
                 }
             }
             recording = handle
+            if (host != null) {
+                hostRecording = host
+                startFrameSampler()
+            }
             return handle
         } catch (error: Throwable) {
-            rememberRecordingFailure(error)
+            if (host == null) rememberRecordingFailure(error)
             throw error
         }
+    }
+
+    @Synchronized
+    fun startFramePreview(wantsFrame: () -> Boolean, publish: (ByteArray) -> Unit) {
+        requireOpen()
+        preview = FramePreview(wantsFrame, publish)
+        startFrameSampler()
+    }
+
+    fun stopFramePreview() { preview = null }
+
+    private fun startFrameSampler() {
+        if (frameSampler != null) return
+        val executor = Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "maestro-harmonyos-screen-frames").apply { isDaemon = true }
+        }
+        frameSampler = executor
+        executor.scheduleWithFixedDelay(::sampleFrame, 0, 500, TimeUnit.MILLISECONDS)
+    }
+
+    private fun stopFrameSampler(sampler: ScheduledExecutorService?) {
+        if (sampler == null) return
+        sampler.shutdown()
+        if (!sampler.awaitTermination(5, TimeUnit.SECONDS)) {
+            sampler.shutdownNow()
+            check(sampler.awaitTermination(2, TimeUnit.SECONDS)) { "Screenshot sampling did not stop before device release." }
+        }
+    }
+
+    private fun sampleFrame() {
+        if (!opened || queryFailure != null) return
+        val viewer = preview?.takeIf { it.wantsFrame() }
+        val recorder = hostRecording?.takeIf { it.wantsFrame() }
+        if (viewer == null && recorder == null) return
+        val saved = pendingFrame.getAndSet(null)?.takeIf { System.nanoTime() - it.capturedAt <= 2_000_000_000 }
+        val frame = saved ?: try {
+            if (!transport.tryLock(0, TimeUnit.NANOSECONDS)) return
+            try {
+                if (!opened || queryFailure != null || System.nanoTime() - lastForegroundIo < 350_000_000) return
+                val bytes = try {
+                    device.previewFrame(minOf(config.commandTimeout, Duration.ofSeconds(3)))
+                } catch (error: HdcTimeoutException) {
+                    // Like an explicit screenshot, a timed-out command may still be running remotely.
+                    queryFailure = error
+                    throw error
+                }
+                HarmonyOSScreenFrame(bytes)
+            } finally {
+                transport.unlock()
+            }
+        } catch (_: HdcException) {
+            return
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return
+        }
+        if (frame.bytes.size !in 8..8 * 1024 * 1024 ||
+            !frame.bytes.copyOf(8).contentEquals(PNG_SIGNATURE)) return
+        recorder?.offer(frame)
+        if (viewer != null && preview === viewer) viewer.publish(frame.bytes)
+    }
+
+    private companion object {
+        val PNG_SIGNATURE = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
     }
 
     private fun rememberRecordingFailure(error: Throwable) {
@@ -308,10 +531,24 @@ class HarmonyOSDriver(
         else if (first !== error && error !in first.suppressed) first.addSuppressed(error)
     }
     override fun setLocation(latitude: Double, longitude: Double): Unit = unsupported("setLocation")
-    override fun setOrientation(orientation: DeviceOrientation): Unit = unsupported("setOrientation")
+    override fun setOrientation(orientation: DeviceOrientation) {
+        requireOpen()
+        lastHierarchy = null
+        lastDeviceInfo = null
+        val rotation = when (orientation) {
+            DeviceOrientation.PORTRAIT -> 0
+            DeviceOrientation.LANDSCAPE_LEFT -> 1
+            DeviceOrientation.UPSIDE_DOWN -> 2
+            DeviceOrientation.LANDSCAPE_RIGHT -> 3
+        }
+        query { device.setDisplayRotation(rotation, config.commandTimeout) }
+    }
     override fun setProxy(host: String, port: Int): Unit = unsupported("setProxy")
     override fun resetProxy(): Unit = unsupported("resetProxy")
-    override fun addMedia(mediaFiles: List<File>): Unit = unsupported("addMedia")
+    override fun addMedia(mediaFiles: List<File>) {
+        requireOpen()
+        query { device.addMedia(mediaFiles.map(File::toPath), config.commandTimeout) }
+    }
     override fun isAirplaneModeEnabled(): Boolean = unsupported("airplane mode detection")
     override fun setAirplaneMode(enabled: Boolean): Unit = unsupported("setAirplaneMode")
     override fun isDarkModeEnabled(): Boolean = unsupported("dark mode detection")
@@ -319,11 +556,13 @@ class HarmonyOSDriver(
 
     private fun input(vararg arguments: String) {
         requireOpen()
-        device.execute(listOf("uitest", "uiInput") + arguments, config.commandTimeout)
+        lastHierarchy = null
+        query { device.execute(listOf("uitest", "uiInput") + arguments, config.commandTimeout) }
     }
 
     private fun aa(arguments: List<String>, expectedSuccess: String) {
-        val output = device.execute(arguments, config.commandTimeout)
+        lastHierarchy = null
+        val output = query { device.execute(arguments, config.commandTimeout) }
         if (output.lineSequence().none { it.trim() == expectedSuccess }) {
             throw HarmonyOSCommandException("aa did not confirm success", output, "")
         }
@@ -335,7 +574,7 @@ class HarmonyOSDriver(
         return query {
             val bytes = device.screenshot(timeout)
             val image = decodeScreenshot(bytes)
-            previewFrame?.invoke(bytes)
+            if (frameSampler != null && (preview != null || hostRecording != null)) pendingFrame.set(HarmonyOSScreenFrame(bytes))
             Screenshot(bytes, image)
         }
     }
@@ -344,16 +583,18 @@ class HarmonyOSDriver(
         return query { device.hierarchy(config.commandTimeout) }
     }
 
-    private fun <T> query(action: () -> T): T {
+    private fun <T> query(action: () -> T): T = transport.withLock {
         queryFailure?.let { throw it }
         try {
-            return action()
+            action()
         } catch (error: HdcTimeoutException) {
             // Deleting a capture file does not prove the timed-out remote command ended.
             // Keep completion hooks, failure screenshots and external callers from
             // issuing more device work in this session. close() can still finish recordings.
             queryFailure = error
             throw error
+        } finally {
+            lastForegroundIo = System.nanoTime()
         }
     }
 

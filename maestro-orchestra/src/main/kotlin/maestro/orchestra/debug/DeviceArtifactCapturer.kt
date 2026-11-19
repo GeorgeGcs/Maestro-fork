@@ -22,7 +22,7 @@ internal class DeviceArtifactCapturer(
         }
     }
 
-    fun collect(appId: String?, flowStartMs: Long): List<CapturedDeviceArtifact> {
+    fun collect(appId: String?, flowStartMs: Long, collectCrashReports: Boolean = true): List<CapturedDeviceArtifact> {
         val dir = outputDir.toFile()
         val out = mutableListOf<CapturedDeviceArtifact>()
         try {
@@ -30,10 +30,12 @@ internal class DeviceArtifactCapturer(
         } catch (e: Exception) {
             logger.warn("Failed to collect device logs", e)
         }
-        try {
-            out += runBlocking { maestro.collectCrashArtifacts(appId, flowStartMs, dir) }
-        } catch (e: Exception) {
-            logger.warn("Failed to collect crash/ANR reports", e)
+        if (collectCrashReports) {
+            try {
+                out += runBlocking { maestro.collectCrashArtifacts(appId, flowStartMs, dir) }
+            } catch (e: Exception) {
+                logger.warn("Failed to collect crash/ANR reports", e)
+            }
         }
         return out
     }

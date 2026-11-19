@@ -42,8 +42,11 @@ internal class HarmonyOsRecorderBackend(private val hdc: HdcClient = HdcClient()
     override fun withSession(config: RecorderConfig, block: (RecorderConnection) -> Unit) {
         val selected = HarmonyOsSessionSupport.selectDevice(config.deviceId, hdc)
         Files.createDirectories(config.artifactsDir)
+        val driverConfig = HarmonyOsSessionSupport.withLayoutRpc(
+            HarmonyOSDriverConfig(abilityName = config.abilityName, moduleName = config.moduleName),
+        )
         HarmonyOsSessionSupport.withSession(
-            selected, hdc, HarmonyOSDriverConfig(abilityName = config.abilityName, moduleName = config.moduleName),
+            selected, hdc, driverConfig,
             ownerId = config.sessionId ?: UUID.randomUUID().toString(),
         ) { session -> block(HarmonyOsRecorder(session.maestro, config)) }
     }

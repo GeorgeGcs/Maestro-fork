@@ -13,7 +13,8 @@ internal class HarmonyOsInteractiveRun(root: Path, attemptId: String) {
     private val stopFile = root.resolve("$attemptId.stop")
     private val previewFile = root.resolve("$attemptId.preview")
     private val frame = root.resolve("$attemptId.png")
-    private var lastPreview = 0L
+    @Volatile private var lastPreview = 0L
+    @Volatile
     var stopRequested: Boolean = false
         private set
 
@@ -28,13 +29,16 @@ internal class HarmonyOsInteractiveRun(root: Path, attemptId: String) {
         return stopRequested
     }
 
-    // The driver has already acquired and validated these bytes. No extra device I/O.
-    fun preview(bytes: ByteArray) {
+    fun wantsPreview(): Boolean {
         val now = System.nanoTime()
-        if (lastPreview != 0L && now - lastPreview < TimeUnit.SECONDS.toNanos(2)) return
-        lastPreview = now
-        if (bytes.size > 4 * 1024 * 1024 ||
-            !Files.isRegularFile(previewFile, LinkOption.NOFOLLOW_LINKS) || shouldStop()) return
+        return (lastPreview == 0L || now - lastPreview >= TimeUnit.SECONDS.toNanos(2)) &&
+            Files.isRegularFile(previewFile, LinkOption.NOFOLLOW_LINKS) && !shouldStop()
+    }
+
+    fun preview(bytes: ByteArray) {
+        if (!wantsPreview()) return
+        lastPreview = System.nanoTime()
+        if (bytes.size > 4 * 1024 * 1024) return
         try {
             val staging = Files.createTempFile(frame.parent, ".preview-", ".tmp")
             try {
@@ -48,4 +52,3 @@ internal class HarmonyOsInteractiveRun(root: Path, attemptId: String) {
         }
     }
 }
-

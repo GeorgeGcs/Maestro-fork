@@ -7,6 +7,7 @@ import maestro.orchestra.debug.ExecutionContext
 import maestro.orchestra.debug.ExecutionEvent
 import maestro.orchestra.debug.ExecutionTraceArtifacts
 import maestro.orchestra.debug.ExecutionTraceEnd
+import maestro.orchestra.debug.HarmonyOSFaultInspection
 import maestro.orchestra.debug.RetryExecutionEvent
 import maestro.orchestra.debug.RetryExecutionFrame
 import maestro.utils.TempFileHandler
@@ -17,6 +18,7 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /** Optional evidence only. Its failures never enter the agent's strict reportingFailure path. */
 internal class HarmonyOsRetryTrace(
@@ -35,7 +37,16 @@ internal class HarmonyOsRetryTrace(
         "runId" to runId, "attemptId" to attemptId, "flowExecutionId" to flowExecutionId,
         "flowPath" to flowPath, "flowSha256" to flowSha256,
     )
-    private data class Step(val id: String, val context: ExecutionContext, val fields: Map<String, Any?>, var ended: Boolean = false)
+    private data class Step(
+        val id: String,
+        val context: ExecutionContext,
+        val fields: Map<String, Any?>,
+        val startedNanos: Long,
+        var finishedNanos: Long? = null,
+        var outcome: String? = null,
+    ) {
+        val ended: Boolean get() = finishedNanos != null
+    }
     private data class Retry(val owner: Int, val parents: List<RetryExecutionFrame>, val optional: Boolean,
         var lastTry: Int = 0, var activeTry: Int? = null, var ended: Boolean = false)
     private val steps = linkedMapOf<Int, Step>()
@@ -92,7 +103,7 @@ internal class HarmonyOsRetryTrace(
             "parentExecutionSequence" to context.parentExecutionSequence,
             "retryContext" to retryContextData(context.retryContext), "flowScopeOwner" to context.flowScopeOwner,
             "phase" to context.phase, "optionalAncestorSequences" to context.optionalAncestorSequences)
-        steps[context.executionSequence] = Step(id, context, data)
+        steps[context.executionSequence] = Step(id, context, data, event.elapsedNanos)
         event("stepStarted", event, data)
     }
 
@@ -101,11 +112,13 @@ internal class HarmonyOsRetryTrace(
         check(step.id == id && step.context == context && !step.ended) { "Step completion does not match its execution." }
         // Validate against the executor's current attempts, not a source-position heuristic.
         retryContextData(context.retryContext)
-        step.ended = true
+        step.finishedNanos = event.elapsedNanos
+        step.outcome = outcome
         outcomeCounts[outcome] = outcomeCounts.getOrDefault(outcome, 0) + 1
         coverage.getOrPut(outcome) { mutableListOf() }.add(context.executionSequence)
-        event(if (outcome == "Interrupted") "stepInterrupted" else "stepFinished", event,
-            step.fields + mapOf("outcome" to if (outcome == "Interrupted") null else outcome, "error" to errorInfo(error)))
+        val data = step.fields + mapOf("outcome" to if (outcome == "Interrupted") null else outcome, "error" to errorInfo(error))
+        val waits = if (event.elementWaits.isEmpty()) emptyMap() else mapOf("elementWaits" to event.elementWaits)
+        event(if (outcome == "Interrupted") "stepInterrupted" else "stepFinished", event, data + waits)
     }
 
     fun retry(value: RetryExecutionEvent) = record {
@@ -173,7 +186,34 @@ internal class HarmonyOsRetryTrace(
             event("flowFinished", value.event, mapOf("success" to value.success, "error" to errorInfo(value.error),
                 "expectedEventCount" to value.expectedEventCount, "lastExecutionSequence" to value.lastExecutionSequence))
             end = value
+            value.faultInspection?.let(::writeFaultReport)
         }
+    }
+
+    private fun writeFaultReport(inspection: HarmonyOSFaultInspection) {
+        val file = artifacts?.allocate?.invoke(FAULT_REPORT_NAME, ArtifactFormat.JSON)?.toPath() ?: return
+        val parents = steps.values.mapNotNullTo(mutableSetOf()) { it.context.parentExecutionSequence }
+        val epoch = inspection.traceEpochMs
+        val clock = inspection.faults?.clock
+        val events = inspection.faults?.events.orEmpty().map { fault ->
+            val match = if (epoch != null && clock != null && fault.occurredAt) {
+                val window = clock.hostWindow(fault.timeMs)
+                steps.values.filter { step ->
+                    val finish = step.finishedNanos ?: return@filter false
+                    step.context.executionSequence !in parents &&
+                        step.outcome != "Skipped" && step.fields["commandName"] !in NON_DEVICE_STEPS &&
+                        window.first - 10 >= epoch + TimeUnit.NANOSECONDS.toMillis(step.startedNanos) + 1 &&
+                        window.last + 10 < epoch + TimeUnit.NANOSECONDS.toMillis(finish)
+                }.singleOrNull()
+            } else null
+            mapOf("event" to fault.event, "deviceTimeMs" to fault.timeMs,
+                "timestampKind" to if (fault.occurredAt) "occurrence" else "reported",
+                "reason" to fault.reason, "details" to fault.details,
+                "stepId" to match?.id, "executionSequence" to match?.context?.executionSequence,
+                "retryContext" to match?.fields?.get("retryContext"))
+        }
+        atomicSummary(file, identity + mapOf("protocol" to "maestro.harmonyos.fault-report", "schemaVersion" to 1,
+            "appId" to inspection.appId, "state" to inspection.state, "events" to events))
     }
 
     /** Called after the real CLI executor has returned or thrown, outside listener dispatch. */
@@ -244,6 +284,12 @@ internal class HarmonyOsRetryTrace(
     }
 
     private fun errorInfo(error: Throwable?) = error?.let { mapOf("class" to it.javaClass.name, "message" to it.message) }
+
+    companion object {
+        const val FAULT_REPORT_NAME = "harmonyos-faults.json"
+        private val NON_DEVICE_STEPS = setOf("ApplyConfigurationCommand", "DefineVariablesCommand", "RunFlowCommand",
+            "RetryCommand", "RepeatCommand", "EvalScriptCommand", "RunScriptCommand")
+    }
 
     private fun sha256(path: Path): String {
         val digest = MessageDigest.getInstance("SHA-256")

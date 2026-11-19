@@ -12,9 +12,9 @@ import java.util.UUID
 
 /** Categories are selected before shell wrapping. Never derive log fields from arbitrary argv. */
 internal enum class HdcCommandCategory {
-    LIST_TARGETS, LAYOUT_FORWARD_LIST, DUMP_LAYOUT, SCREEN_CAPTURE, INPUT_TAP, INPUT_SWIPE, INPUT_TEXT, INPUT_KEY,
-    INPUT_OTHER, FILE_RECEIVE, REMOVE_FILE, APP_START, APP_STOP, PROCESS_QUERY, SERVICE_QUERY,
-    MEDIA_QUERY, MEDIA_RECEIVE, MEDIA_DELETE, FILE_STAT, FILE_TEST, SHELL_SCRIPT, SHELL_OTHER, UNKNOWN;
+    LIST_TARGETS, LAYOUT_FORWARD_LIST, LAYOUT_FORWARD_CREATE, LAYOUT_FORWARD_REMOVE, DUMP_LAYOUT, SCREEN_CAPTURE, INPUT_TAP, INPUT_SWIPE, INPUT_TEXT, INPUT_KEY,
+    INPUT_OTHER, FILE_RECEIVE, FILE_SEND, REMOVE_FILE, APP_START, APP_STOP, PROCESS_QUERY, SERVICE_QUERY,
+    MEDIA_QUERY, MEDIA_RECEIVE, MEDIA_DELETE, FILE_STAT, FILE_TEST, FAULT_QUERY, SHELL_SCRIPT, SHELL_OTHER, UNKNOWN;
 
     companion object {
         fun shell(arguments: List<String>): HdcCommandCategory = when (arguments.firstOrNull()) {
@@ -31,9 +31,11 @@ internal enum class HdcCommandCategory {
                 else -> SHELL_OTHER
             }
             "rm" -> REMOVE_FILE
+            "snapshot_display" -> SCREEN_CAPTURE
             "aa" -> when (arguments.getOrNull(1)) { "start" -> APP_START; "force-stop" -> APP_STOP; else -> SHELL_OTHER }
             "ps" -> PROCESS_QUERY
             "hidumper" -> SERVICE_QUERY
+            "hisysevent" -> FAULT_QUERY
             "stat" -> FILE_STAT
             "test" -> FILE_TEST
             "mediatool" -> when (arguments.getOrNull(1)) {

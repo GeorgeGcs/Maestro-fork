@@ -6,6 +6,7 @@ import maestro.cli.harmonyos.AgentError
 import maestro.cli.harmonyos.AgentProtocolException
 import maestro.drivers.HarmonyOSDriver
 import maestro.harmonyos.driver.HarmonyOSDriverConfig
+import maestro.harmonyos.driver.HarmonyOSArkWebTarget
 import maestro.harmonyos.hdc.HdcClient
 import maestro.harmonyos.hdc.HdcException
 import maestro.harmonyos.hdc.HdcDeviceSelectionException
@@ -77,16 +78,33 @@ internal object HarmonyOsSessionSupport {
         HarmonyOSDriverConfig(
             abilityName = environment["MAESTRO_HARMONYOS_ABILITY"]?.trim()?.takeIf { it.isNotEmpty() },
             moduleName = environment["MAESTRO_HARMONYOS_MODULE"]?.trim()?.takeIf { it.isNotEmpty() },
-            layoutRpcPort = environment["MAESTRO_HARMONYOS_LAYOUT_RPC_PORT"]?.let {
+            arkWebPort = environment["MAESTRO_HARMONYOS_ARKWEB_PORT"]?.let {
                 it.toIntOrNull()?.takeIf { port -> port in 1024..65535 }
-                    ?: throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_PORT must be 1024..65535.")
+                    ?: throw CliError("MAESTRO_HARMONYOS_ARKWEB_PORT must be 1024..65535.")
             },
-            layoutRpcDevice = environment["MAESTRO_HARMONYOS_LAYOUT_RPC_DEVICE"],
+            arkWebBundle = environment["MAESTRO_HARMONYOS_ARKWEB_BUNDLE"],
+            arkWebTarget = environment["MAESTRO_HARMONYOS_ARKWEB_WEBVIEW_ID"].let { id ->
+                val url = environment["MAESTRO_HARMONYOS_ARKWEB_PAGE_URL"]
+                if (id == null && url == null) null
+                else if (id.isNullOrBlank() || url.isNullOrBlank()) {
+                    throw CliError("Set both MAESTRO_HARMONYOS_ARKWEB_WEBVIEW_ID and MAESTRO_HARMONYOS_ARKWEB_PAGE_URL.")
+                } else HarmonyOSArkWebTarget(id, url)
+            },
+            strictFaultDiagnostics = when (environment["MAESTRO_HARMONYOS_STRICT_FAULT_DIAGNOSTICS"]?.trim()) {
+                null, "", "false" -> false
+                "true" -> true
+                else -> throw CliError("MAESTRO_HARMONYOS_STRICT_FAULT_DIAGNOSTICS must be true or false.")
+            },
             enableScreenRecording = when (val backend = environment["MAESTRO_HARMONYOS_RECORDING"]?.trim()) {
-                null, "", "off" -> false
+                null, "", "off", "host-frames" -> false
                 "huawei-system" -> true
-                else -> throw CliError("Unknown HarmonyOS recording backend '$backend'; use huawei-system or off.")
+                else -> throw CliError("Unknown HarmonyOS recording backend '$backend'; use host-frames, huawei-system or off.")
             },
+            hostRecordingFfmpeg = if (environment["MAESTRO_HARMONYOS_RECORDING"]?.trim() == "host-frames") {
+                val ffmpeg = environment["MAESTRO_HARMONYOS_FFMPEG"]?.takeIf(String::isNotBlank)?.let(Path::of)
+                ffmpeg?.takeIf { it.isAbsolute && Files.isRegularFile(it) && Files.isExecutable(it) }
+                    ?: throw CliError("Set MAESTRO_HARMONYOS_FFMPEG to an absolute FFmpeg executable for host-frames.")
+            } else null,
             recordingRetainMedia = when (val retain = environment["MAESTRO_HARMONYOS_RECORDING_RETAIN_MEDIA"]?.trim()) {
                 null, "", "false" -> false
                 "true" -> true
@@ -99,6 +117,20 @@ internal object HarmonyOsSessionSupport {
                 }
                 Duration.ofSeconds(seconds)
             } ?: Duration.ofMinutes(3),
+        ).let { withLayoutRpc(it, environment) }
+
+    fun withLayoutRpc(config: HarmonyOSDriverConfig, environment: Map<String, String> = System.getenv()): HarmonyOSDriverConfig =
+        config.copy(
+            layoutRpcPort = environment["MAESTRO_HARMONYOS_LAYOUT_RPC_PORT"]?.let {
+                it.toIntOrNull()?.takeIf { port -> port in 1024..65535 }
+                    ?: throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_PORT must be 1024..65535.")
+            },
+            layoutRpcDevice = environment["MAESTRO_HARMONYOS_LAYOUT_RPC_DEVICE"],
+            automaticLayoutRpc = when (environment["MAESTRO_HARMONYOS_LAYOUT_RPC_AUTO"]?.trim()) {
+                null, "", "true" -> true
+                "false" -> false
+                else -> throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_AUTO must be true or false.")
+            },
         )
 
     fun <T> withSession(
@@ -107,51 +139,69 @@ internal object HarmonyOsSessionSupport {
         config: HarmonyOSDriverConfig = driverConfig(),
         lockDirectory: Path = defaultLockDirectory(),
         ownerId: String = UUID.randomUUID().toString(),
+        ciAttempt: HarmonyOsDevicePool.CiAttempt? = null,
         block: (MaestroSessionManager.MaestroSession) -> T,
-    ): T =
-        withDeviceLock(deviceId, lockDirectory) {
-            val lease = HarmonyOsSessionLease.begin(deviceId, ownerId, lockDirectory,
-                requiresRecordingCleanup = config.enableScreenRecording, hdc = hdc)
-            var session: MaestroSessionManager.MaestroSession? = null
-            val closeGuard = Any()
-            var closed = false
-            var rememberedCloseFailure: Throwable? = null
-            fun closeOnce() {
-                synchronized(closeGuard) {
-                    if (!closed) {
-                        closed = true
-                        try { session?.close() } catch (error: Throwable) { rememberedCloseFailure = error }
-                    }
-                    rememberedCloseFailure?.let { throw it }
-                }
-            }
-            val shutdownHook = Thread({ runCatching { closeOnce() } }, "maestro-harmonyos-close")
-            var registered = false
-            var failure: Throwable? = null
-            try {
-                val driver = HarmonyOSDriver(deviceId, hdc = hdc.withRecoveryJournal(lease.journal), config = config)
-                val openedSession = MaestroSessionManager.MaestroSession(Maestro(driver))
-                session = openedSession
-                Runtime.getRuntime().addShutdownHook(shutdownHook)
-                registered = true
-                driver.open()
-                block(openedSession)
-            } catch (error: Throwable) {
-                failure = error
-                throw error
-            } finally {
-                if (registered) runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
-                val closeError = try { closeOnce(); null } catch (error: Throwable) { error }
-                val leaseError = try { lease.finish(closeError, hdc); null } catch (error: Throwable) { error }
-                val original = failure
-                if (original != null) {
-                    listOfNotNull(closeError, leaseError).filter { it !== original }.forEach(original::addSuppressed)
-                } else if (closeError != null) {
-                    if (leaseError != null && leaseError !== closeError) closeError.addSuppressed(leaseError)
-                    throw closeError
-                } else if (leaseError != null) throw leaseError
+    ): T {
+        val run = {
+            withDeviceLock(deviceId, lockDirectory) {
+                runDeviceSession(deviceId, hdc, config, lockDirectory, ownerId, block)
             }
         }
+        val stateDirectory = System.getenv(HarmonyOsDevicePool.STATE_DIRECTORY_ENV)?.takeIf(String::isNotBlank)
+        return if (stateDirectory == null) run() else
+            HarmonyOsDevicePool.withAllocationGate(deviceId, Path.of(stateDirectory), ciAttempt, run)
+    }
+
+    private fun <T> runDeviceSession(
+        deviceId: String,
+        hdc: HdcClient,
+        config: HarmonyOSDriverConfig,
+        lockDirectory: Path,
+        ownerId: String,
+        block: (MaestroSessionManager.MaestroSession) -> T,
+    ): T {
+        val lease = HarmonyOsSessionLease.begin(deviceId, ownerId, lockDirectory,
+            requiresRecordingCleanup = config.enableScreenRecording, hdc = hdc)
+        var session: MaestroSessionManager.MaestroSession? = null
+        val closeGuard = Any()
+        var closed = false
+        var rememberedCloseFailure: Throwable? = null
+        fun closeOnce() {
+            synchronized(closeGuard) {
+                if (!closed) {
+                    closed = true
+                    try { session?.close() } catch (error: Throwable) { rememberedCloseFailure = error }
+                }
+                rememberedCloseFailure?.let { throw it }
+            }
+        }
+        val shutdownHook = Thread({ runCatching { closeOnce() } }, "maestro-harmonyos-close")
+        var registered = false
+        var failure: Throwable? = null
+        try {
+            val driver = HarmonyOSDriver(deviceId, hdc = hdc.withRecoveryJournal(lease.journal), config = config)
+            val openedSession = MaestroSessionManager.MaestroSession(Maestro(driver))
+            session = openedSession
+            Runtime.getRuntime().addShutdownHook(shutdownHook)
+            registered = true
+            driver.open()
+            return block(openedSession)
+        } catch (error: Throwable) {
+            failure = error
+            throw error
+        } finally {
+            if (registered) runCatching { Runtime.getRuntime().removeShutdownHook(shutdownHook) }
+            val closeError = try { closeOnce(); null } catch (error: Throwable) { error }
+            val leaseError = try { lease.finish(closeError, hdc); null } catch (error: Throwable) { error }
+            val original = failure
+            if (original != null) {
+                listOfNotNull(closeError, leaseError).filter { it !== original }.forEach(original::addSuppressed)
+            } else if (closeError != null) {
+                if (leaseError != null && leaseError !== closeError) closeError.addSuppressed(leaseError)
+                throw closeError
+            } else if (leaseError != null) throw leaseError
+        }
+    }
 
     internal fun <T> withDeviceLock(
         deviceId: String,

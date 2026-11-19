@@ -576,7 +576,9 @@ class TestCommand : Callable<Int> {
             isHeadless = headless,
             screenSize = screenSize,
             reinstallDriver = reinstallDriver,
-            executionPlan = executionPlan
+            executionPlan = executionPlan,
+            harmonyOsRunId = harmonyOsRunId,
+            harmonyOsAttemptId = harmonyOsAttemptId,
         ) { session ->
             val maestro = session.maestro
             val device = session.device
@@ -584,7 +586,9 @@ class TestCommand : Callable<Int> {
             val report = harmonyOsAgentReport
             val driver = maestro.driver as? HarmonyOSDriver
             val interactive = report?.interactive
-            if (interactive != null) driver?.previewFrame = interactive::preview
+            if (interactive != null && driver != null) {
+                driver.startFramePreview(interactive::wantsPreview, interactive::preview)
+            }
             try {
                 report?.checkStop()
                 runOnSession(maestro, device, chunkPlans, shardIndex, debugOutputPath, deviceId, effectiveShards).also {
@@ -595,7 +599,9 @@ class TestCommand : Callable<Int> {
                 report.failed(error)
                 Triple(0, 1, null)
             } finally {
-                if (interactive != null) driver?.previewFrame = null
+                if (interactive != null && driver != null) {
+                    driver.stopFramePreview()
+                }
             }
         }.also {
             agentSession?.let { harmonyOsAgentReport?.sessionClosedNormally(it) }

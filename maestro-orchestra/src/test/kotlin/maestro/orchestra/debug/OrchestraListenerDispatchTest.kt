@@ -5,6 +5,8 @@ import com.google.common.truth.Truth.assertThat
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.verify
+import io.mockk.coVerify
 import kotlinx.coroutines.runBlocking
 import maestro.DeviceInfo
 import maestro.KeyCode
@@ -13,12 +15,17 @@ import maestro.MaestroException
 import maestro.TreeNode
 import maestro.ViewHierarchy
 import maestro.device.Platform
+import maestro.device.DeviceArtifactFiles
+import maestro.drivers.HarmonyOSDriver
+import maestro.harmonyos.driver.HarmonyOSFlowFault
+import maestro.harmonyos.driver.HarmonyOSFlowFaults
 import maestro.js.JsEngine
 import maestro.orchestra.ApplyConfigurationCommand
 import maestro.orchestra.AssertConditionCommand
 import maestro.orchestra.AssertScreenshotCommand
 import maestro.orchestra.Condition
 import maestro.orchestra.DefineVariablesCommand
+import maestro.orchestra.ElementSelector
 import maestro.orchestra.EvalScriptCommand
 import maestro.orchestra.MaestroCommand
 import maestro.orchestra.MaestroConfig
@@ -95,6 +102,73 @@ class OrchestraListenerDispatchTest {
             val bytes = png(if (changing) 40 * captures++ else 0)
             firstArg<Sink>().buffer().use { it.write(bytes) }
         }
+    }
+
+    @Test
+    fun `supplemental frames do not exhaust the following assertion budget`() = runBlocking {
+        val maestro = mockMaestro()
+        every { maestro.driver } returns mockk<HarmonyOSDriver>(relaxed = true)
+        coEvery { maestro.takeScreenshot(any<Sink>(), any(), any()) } answers {
+            Thread.sleep(300)
+            firstArg<Sink>().close()
+        }
+        var lookupBudget = 0L
+        coEvery { maestro.findElementWithTimeout(any(), any(), null) } answers {
+            lookupBudget = firstArg()
+            null
+        }
+        val waits = mutableListOf<ElementWaitObservation>()
+        val listener = object : OrchestraListener {
+            override fun onCommandExecutionFinished(cmd: MaestroCommand, context: ExecutionContext, outcome: CommandOutcome,
+                                                    startedAt: Long, finishedAt: Long, event: ExecutionEvent) {
+                waits.addAll(event.elementWaits)
+            }
+        }
+        val key = MaestroCommand(pressKeyCommand = PressKeyCommand(KeyCode.BACK))
+        val assertion = MaestroCommand(assertConditionCommand = AssertConditionCommand(
+            Condition(visible = ElementSelector(textRegex = "missing")), timeout = "500",
+        ))
+        val orchestra = Orchestra(maestro, artifactsDir = tempDir, captureStepEvidence = true,
+            listeners = listOf(listener), onCommandFailed = { _, _, _ -> Orchestra.ErrorResolution.FAIL })
+        assertThat(orchestra.runFlow(listOf(key, assertion)).success).isFalse()
+        assertThat(lookupBudget).isGreaterThan(0L)
+        assertThat(waits.single().budgetMs).isEqualTo(lookupBudget)
+        assertThat(waits.single().satisfied).isFalse()
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = ["passed", "failed", "strict"])
+    fun `HarmonyOS diagnostics share one query between failure and artifacts`(scenario: String) = runBlocking {
+        val driver = mockk<HarmonyOSDriver>()
+        val maestro = mockMaestro()
+        every { maestro.driver } returns driver
+        every { driver.strictFaultDiagnostics } returns (scenario == "strict")
+        every { driver.flowFaults("com.target", any(), any()) } answers {
+            val at = secondArg<Long>()
+            assertThat(thirdArg<Long>()).isAtLeast(at)
+            HarmonyOSFlowFaults(
+                HarmonyOSFlowFault("JS_ERROR", at, "matched crash"),
+                HarmonyOSFlowFault("APP_FREEZE", at, "matched freeze"),
+            )
+        }
+        val config = MaestroCommand(applyConfigurationCommand = ApplyConfigurationCommand(MaestroConfig(appId = "com.target")))
+        val assertion = MaestroCommand(assertConditionCommand = AssertConditionCommand(
+            Condition(scriptCondition = if (scenario == "failed") "false" else "true"),
+        ))
+        val orchestra = Orchestra(maestro = maestro, artifactsDir = tempDir)
+        if (scenario == "passed") {
+            assertThat(orchestra.runFlow(listOf(config, assertion)).success).isTrue()
+            verify(exactly = 0) { driver.flowFaults(any(), any(), any()) }
+        } else {
+            val failure = assertThrows<MaestroException.AppCrash> {
+                orchestra.runFlow(listOf(config, assertion))
+            }
+            assertThat(failure.message).contains("matched crash")
+            verify(exactly = 1) { driver.flowFaults(any(), any(), any()) }
+            assertThat(tempDir.resolve("logs/${DeviceArtifactFiles.CRASH_REPORT}").toFile().readText()).contains("matched crash")
+            assertThat(tempDir.resolve("logs/${DeviceArtifactFiles.ANR_REPORT}").toFile().readText()).contains("matched freeze")
+        }
+        coVerify(exactly = 0) { maestro.collectCrashArtifacts(any(), any(), any()) }
     }
 
     private class RecordingListener : OrchestraListener {

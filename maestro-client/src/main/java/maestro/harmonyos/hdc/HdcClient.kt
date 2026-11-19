@@ -1,6 +1,8 @@
 package maestro.harmonyos.hdc
 
 import java.nio.file.Path
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.time.Duration
 
 class HdcCommandException(val result: HdcCommandResult, val confirmedRemoteExitCode: Int? = null) :
@@ -66,9 +68,72 @@ class HdcClient(
     /** Verify the exact owner and endpoint before any loopback connection. */
     internal fun hasUitestLayoutForward(deviceId: String, port: Int, timeout: Duration): Boolean {
         validateDeviceId(deviceId)
+        return matchesUitestLayoutForward(listForwards(timeout), deviceId, port)
+    }
+
+    private fun listForwards(timeout: Duration): String {
         val result = execute(listOf("fport", "ls"), timeout, category = HdcCommandCategory.LAYOUT_FORWARD_LIST)
         if (result.stderr.isNotBlank()) throw HdcException("HDC forward listing returned diagnostics")
-        return matchesUitestLayoutForward(result.stdout, deviceId, port)
+        val rows = result.stdout.lineSequence().map(String::trim).filter(String::isNotEmpty).toList()
+        if (rows != listOf("[Empty]") && (rows.isEmpty() || rows.any { !forwardRow.matches(it) })) {
+            throw HdcException("HDC forward listing has an unrecognized format.")
+        }
+        return result.stdout
+    }
+
+    /** Uses a running UITest service; creating a transport never starts or replaces a device daemon. */
+    internal fun openAutomaticUitestLayoutForward(deviceId: String, timeout: Duration): Int? {
+        validateDeviceId(deviceId)
+        val journal = recoveryJournal ?: return null
+        check(journal.deviceId == deviceId) { "UITest forward does not match the session target." }
+        val deadline = System.nanoTime() + timeout.toNanos()
+        fun remaining(): Duration {
+            val nanos = deadline - System.nanoTime()
+            if (nanos <= 0) throw HdcTimeoutException(timeout)
+            return Duration.ofNanos(nanos)
+        }
+        val sockets = execute(listOf("-t", deviceId, "shell", "cat /proc/net/unix"), remaining(),
+            category = HdcCommandCategory.SERVICE_QUERY)
+        if (sockets.stderr.isNotBlank() || sockets.stdout.lineSequence().none { line ->
+                val columns = line.trim().split(Regex("\\s+"))
+                columns.size == 8 && columns[3].toIntOrNull(16)?.and(0x10000) == 0x10000 &&
+                    columns[4].toIntOrNull(16) == 1 && columns[7] == "@uitest_socket"
+            }) return null
+        val port = try {
+            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        } catch (error: java.io.IOException) {
+            throw HdcException("No loopback port could be allocated for UITest.", error)
+        }
+        if (portRows(listForwards(remaining()), port).isNotEmpty()) return null
+        journal.registerLayoutForward(port)
+        val created = execute(listOf("-t", deviceId, "fport", "tcp:$port", UITEST_ENDPOINT), remaining(), trackHost = true,
+            category = HdcCommandCategory.LAYOUT_FORWARD_CREATE)
+        if (created.stderr.isNotBlank() || created.stdout.trim().removeSuffix(".") != "Forwardport result:OK") {
+            throw HdcException("HDC did not confirm creation of the UITest forward.")
+        }
+        journal.confirmLayoutForward(port)
+        return port.takeIf { hasUitestLayoutForward(deviceId, it, remaining()) }
+    }
+
+    /** Reconcile only the registered local port. An exact but unconfirmed rule needs operator review. */
+    internal fun recoverUitestLayoutForward(journal: HarmonyOSRecoveryJournal, port: Int, confirmed: Boolean,
+                                             remaining: () -> Duration) {
+        val deviceId = journal.deviceId
+        val before = listForwards(remaining())
+        val expected = listOf(deviceId, "tcp:$port", UITEST_ENDPOINT, "[Forward]")
+        val rows = portRows(before, port)
+        if (expected !in rows) return
+        if (!confirmed || rows != listOf(expected)) throw HdcException("UITest forward ownership could not be confirmed.")
+        execute(listOf("-t", deviceId, "fport", "rm", "tcp:$port", UITEST_ENDPOINT), remaining(),
+            journal = journal, trackHost = true, allowSealed = true, category = HdcCommandCategory.LAYOUT_FORWARD_REMOVE)
+        if (expected in portRows(listForwards(remaining()), port)) throw HdcException("UITest forward removal could not be confirmed.")
+    }
+
+    internal fun hasArkWebForward(deviceId: String, port: Int, pid: String, timeout: Duration): Boolean {
+        validateDeviceId(deviceId)
+        val result = execute(listOf("fport", "ls"), timeout, category = HdcCommandCategory.LAYOUT_FORWARD_LIST)
+        if (result.stderr.isNotBlank()) throw HdcException("HDC forward listing returned diagnostics")
+        return matchesForward(result.stdout, deviceId, port, "localabstract:webview_devtools_remote_$pid")
     }
 
     /**
@@ -86,6 +151,15 @@ class HdcClient(
     internal fun shellFinite(deviceId: String, arguments: List<String>, timeout: Duration, finite: Boolean,
                              category: HdcCommandCategory = HdcCommandCategory.shell(arguments)): HdcCommandResult =
         shellTracked(deviceId, arguments, timeout, finite, category)
+
+    // The caller builds these commands from fixed read-only queries. Track the local
+    // HDC process, but do not create a device operation directory or await a remote receipt.
+    internal fun shellDiagnostic(deviceId: String, script: String, timeout: Duration,
+                                 category: HdcCommandCategory): HdcCommandResult {
+        validateDeviceId(deviceId)
+        check(!resourceRecovery) { "Diagnostic queries are for active sessions." }
+        return rawShell(deviceId, listOf("sh", "-c", script), timeout, true, category = category)
+    }
 
     private fun shellTracked(deviceId: String, arguments: List<String>, timeout: Duration, finite: Boolean,
                              category: HdcCommandCategory = HdcCommandCategory.shell(arguments)): HdcCommandResult {
@@ -149,6 +223,25 @@ class HdcClient(
             .also { if (resourceRecovery) checkResourceRecoveryReady(checkNotNull(recoveryJournal)) }
     }
 
+    internal fun <T> externalMutation(arguments: List<String>, dispatch: () -> T): T =
+        if (recoveryJournal == null) dispatch() else recoveryJournal.externalMutation(arguments, dispatch)
+
+    internal fun sendGalleryFile(deviceId: String, local: Path, remote: String, bytes: Long, timeout: Duration) {
+        validateDeviceId(deviceId)
+        require(remote.matches(Regex("/mnt/data/[0-9]+/media_fuse/Photo/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}")))
+        recoveryJournal?.let { require(it.deviceId == deviceId) { "Recovery journal belongs to another target." } }
+        val arguments = listOf("-t", deviceId, "file", "send", local.toAbsolutePath().toString(), remote)
+        externalMutation(arguments) {
+            val result = execute(arguments, timeout, recoveryJournal != null, category = HdcCommandCategory.FILE_SEND)
+            val completion = Regex("FileTransfer finish, Size:([0-9]+), File count = 1(?:,.*)?")
+            if (result.stderr.isNotBlank() || result.stdout.lineSequence().none {
+                    completion.matchEntire(it.trim())?.groupValues?.get(1)?.toLongOrNull() == bytes
+                }) {
+                throw HdcException("HDC did not confirm the gallery transfer byte count.")
+            }
+        }
+    }
+
     private fun checkResourceRecoveryReady(journal: HarmonyOSRecoveryJournal) {
         val issues = journal.snapshot().issues.filter { it.code != "OWNED_RESOURCES_REMAIN" }
         check(issues.isEmpty()) { "Resource recovery is not quiescent: ${issues.joinToString { it.code }}" }
@@ -204,12 +297,21 @@ class HdcClient(
 
     companion object {
         internal fun finiteCommand(arguments: List<String>): Boolean =
+            (arguments.size == 9 && arguments[0] == "snapshot_display" &&
+                arguments[1] == "-f" && arguments[2].matches(Regex("/data/local/tmp/maestro-(?:session-[a-f0-9-]{36}/files/)?screen-[a-f0-9-]{36}\\.png")) &&
+                arguments[3] == "-w" && arguments[4].toIntOrNull() in 2..960 &&
+                arguments[5] == "-h" && arguments[6].toIntOrNull() in 2..960 &&
+                arguments[7] == "-t" && arguments[8] == "png") ||
             (arguments.firstOrNull() == "uitest" && arguments.getOrNull(1) in setOf("dumpLayout", "screenCap", "uiInput")) ||
                 (arguments.firstOrNull() == "aa" && arguments.getOrNull(1) in setOf("start", "force-stop")) ||
                 (arguments.take(2) == listOf("rm", "-f") && arguments.size == 3) ||
                 (arguments == listOf("ps", "-ef")) ||
                 (arguments == listOf("hidumper", "-s", "3002", "-a", "-h")) ||
-                (arguments == listOf("bm", "dump", "-n", "com.huawei.hmos.screenrecorder")) ||
+                (arguments == listOf("hidumper", "-s", "DisplayManagerService", "-a", "-a")) ||
+                (arguments.size == 4 && arguments.take(3) == listOf("bm", "dump", "-n") &&
+                    arguments[3].matches(Regex("[A-Za-z0-9_][A-Za-z0-9_.]*"))) ||
+                (arguments.size == 5 && arguments.take(4) == listOf("bm", "clean", "-d", "-n") &&
+                    arguments[4].matches(Regex("[A-Za-z0-9_][A-Za-z0-9_.]*"))) ||
                 (arguments.take(3) == listOf("stat", "-c", "%s") && arguments.size == 4 && recordingScratch(arguments[3])) ||
                 (arguments.size == 3 && arguments[0] == "test" && arguments[1] in setOf("-L", "-e", "-f") && recordingScratch(arguments[2])) ||
                 (arguments.take(2) == listOf("mediatool", "query") && arguments.size == 4 &&
@@ -229,11 +331,18 @@ class HdcClient(
         private fun hasHdcFailure(output: String): Boolean = hdcFailurePattern.containsMatchIn(output)
 
         internal fun matchesUitestLayoutForward(output: String, deviceId: String, port: Int): Boolean {
-            val local = "tcp:$port"
-            val matching = output.lineSequence().map { it.trim().split(Regex("\\s+")) }
-                .filter { it.getOrNull(1) == local }.toList()
-            return matching == listOf(listOf(deviceId, local, "localabstract:uitest_socket", "[Forward]"))
+            return matchesForward(output, deviceId, port, UITEST_ENDPOINT)
         }
+
+        private fun matchesForward(output: String, deviceId: String, port: Int, remote: String): Boolean {
+            return portRows(output, port) == listOf(listOf(deviceId, "tcp:$port", remote, "[Forward]"))
+        }
+
+        private fun portRows(output: String, port: Int): List<List<String>> = output.lineSequence()
+            .map { it.trim().split(Regex("\\s+")) }.filter { it.getOrNull(1) == "tcp:$port" }.toList()
+
+        private const val UITEST_ENDPOINT = "localabstract:uitest_socket"
+        private val forwardRow = Regex("[A-Za-z0-9][A-Za-z0-9._:-]*\\s+\\S+:\\S+\\s+\\S+:\\S+\\s+\\[(Forward|Reverse)]")
 
         internal fun parseDeviceList(output: String): List<String> {
             val lines = output.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()

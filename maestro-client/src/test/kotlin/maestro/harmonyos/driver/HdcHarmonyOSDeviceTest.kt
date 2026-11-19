@@ -6,6 +6,7 @@ import maestro.harmonyos.hdc.HdcCommandException
 import maestro.harmonyos.hdc.HdcCommandResult
 import maestro.harmonyos.hdc.HdcCommandRunner
 import maestro.harmonyos.hdc.HdcException
+import maestro.harmonyos.hdc.HdcTimeoutException
 import maestro.harmonyos.hdc.HarmonyOSRecoveryJournal
 import maestro.utils.TempFileHandler
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -16,6 +17,75 @@ import java.time.Duration
 import java.util.UUID
 
 class HdcHarmonyOSDeviceTest {
+    @Test
+    fun `preview requests bounded pixels and explicit screenshots keep the original backend`() {
+        val commands = mutableListOf<String>()
+        val png = java.io.ByteArrayOutputStream().also {
+            javax.imageio.ImageIO.write(java.awt.image.BufferedImage(960, 630, 1), "png", it)
+        }.toByteArray()
+        val device = device { command, _ ->
+            commands += command.last()
+            if (command.getOrNull(3) == "file") {
+                Files.write(Path.of(command.last()), png)
+                HdcCommandResult(0, "FileTransfer finish", "")
+            } else {
+                val output = if ("hidumper" in command.last()) """
+                    [SCREEN SESSION]
+                    DisplayId: 0
+                    activeModes<id, W, H, RS>: 512, 2800, 1840, 60
+                    Rotation: 0
+                """.trimIndent() else ""
+                HdcCommandResult(0, "$output\n${marker(command)}0\n", "")
+            }
+        }
+        assertThat(device.previewFrame(TIMEOUT)).isEqualTo(png)
+        assertThat(commands.any { "snapshot_display" in it && "'960'" in it && "'630'" in it }).isTrue()
+        commands.clear()
+        device.screenshot(TIMEOUT)
+        assertThat(commands.any { "screenCap" in it }).isTrue()
+        assertThat(commands.any { "snapshot_display" in it }).isFalse()
+    }
+
+    @Test
+    fun `focus follows the window owner rather than the presence of the target process`() {
+        var focus = 13
+        val device = device { command, _ ->
+            val output = when {
+                "WindowManagerService" in command.last() -> """
+                    WindowName DisplayId Pid WinId Type Mode Flag ZOrd Orientation [ x y w h ]
+                    SCB Desktop 0 1623 13 2001 1 0 2 0 [ 0 0 1272 2756 ]
+                    componentcollection0 0 20165 68 1 1 0 102 0 [ 0 0 1272 2756 ]
+                    Focus window: $focus
+                """.trimIndent()
+                else -> "PID NAME\n1623 com.ohos.sceneboard\n20165 org.example.demo:ui"
+            }
+            HdcCommandResult(0, "$output\n${marker(command)}0\n", "")
+        }
+        assertThat(device.hasAppFocus("org.example.demo", TIMEOUT)).isFalse()
+        focus = 68
+        assertThat(device.hasAppFocus("org.example.demo", TIMEOUT)).isTrue()
+        assertThat(device.hasAppFocus("org.example", TIMEOUT)).isFalse()
+    }
+
+    @Test
+    fun `a timed out fault query leaves no pending device operation`() = TempFileHandler().use { files ->
+        val directory = files.createTempDirectory("read-only-diagnostics").toPath()
+        HarmonyOSRecoveryJournal.create(directory.resolve("journal.json"), "fixture-device", UUID.randomUUID().toString()).use { journal ->
+            val client = HdcClient("fake", HdcCommandRunner { command, timeout ->
+                assertThat(command.last()).doesNotContain("MAESTRO_RECOVERY")
+                if ("hisysevent" in command.last()) throw HdcTimeoutException(timeout)
+                HdcCommandResult(0, "1784272560000\n${marker(command)}0\n", "")
+            }).withRecoveryJournal(journal)
+            val device = HdcHarmonyOSDevice("fixture-device", client)
+            assertThrows(HdcTimeoutException::class.java) {
+                device.flowFaults("org.example.demo", 1, 2, TIMEOUT)
+            }
+            assertThat(journal.snapshot().pendingOperations).isEqualTo(0)
+            journal.seal()
+            assertThat(journal.snapshot().issues).isEmpty()
+        }
+    }
+
     @Test fun `a tracked remote proof does not hide a different host exit failure`() = TempFileHandler().use { files ->
         val directory = files.createTempDirectory("tracked-host-failure-test").toPath()
         HarmonyOSRecoveryJournal.create(directory.resolve("journal.json"), "fixture-device", UUID.randomUUID().toString()).use { journal ->

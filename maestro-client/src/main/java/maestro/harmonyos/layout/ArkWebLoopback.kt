@@ -1,0 +1,150 @@
+package maestro.harmonyos.layout
+
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import maestro.TreeNode
+import maestro.harmonyos.driver.HarmonyOSArkWebTarget
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.slf4j.LoggerFactory
+import java.net.Proxy
+import java.net.URI
+import java.time.Duration
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+
+/** Reads a test WebView through an already configured, device-verified HDC forward. */
+internal class ArkWebLoopback(private val port: Int, private val target: HarmonyOSArkWebTarget? = null) : AutoCloseable {
+    private val endpoint = "127.0.0.1:$port"
+    private val logger = LoggerFactory.getLogger(ArkWebLoopback::class.java)
+    private var connection: Connection? = null
+    private var sequence = 0L
+
+    private fun discoverPage(timeout: Duration): String? {
+        val request = Request.Builder().url("http://$endpoint/json/list").build()
+        val call = client.newCall(request)
+        call.timeout().timeout(timeout.toNanos(), TimeUnit.NANOSECONDS)
+        return call.execute().use { response ->
+            if (!response.isSuccessful) return null
+            val body = response.peekBody(MAX_JSON_BYTES + 1).string()
+            if (body.length > MAX_JSON_BYTES) return null
+            val targets = json.readTree(body)
+            if (!targets.isArray) return null
+            val page = targets.singleOrNull { page ->
+                page.path("type").asText() == "page" && (target == null || page.path("url").textValue() == target.pageUrl)
+            } ?: return null
+            val uri = URI(page.path("webSocketDebuggerUrl").asText())
+            uri.rawPath?.takeIf { uri.scheme == "ws" && uri.port == port &&
+                uri.host in setOf("localhost", "127.0.0.1") &&
+                it.matches(Regex("/devtools/page/[A-Za-z0-9_-]+")) } ?: return null
+        }
+    }
+
+    @Synchronized
+    fun snapshot(bounds: List<Int>, timeout: Duration, verifyForward: (Duration) -> Boolean): TreeNode? {
+        val deadline = System.nanoTime() + timeout.toNanos()
+        fun remaining(): Duration {
+            val nanos = deadline - System.nanoTime()
+            if (nanos <= 0) throw java.util.concurrent.TimeoutException("ArkWeb snapshot deadline expired")
+            return Duration.ofNanos(nanos)
+        }
+        var active = connection?.takeIf { !it.failed && System.nanoTime() - it.openedAt < FORWARD_TTL_NANOS }
+        if ((active == null || target != null) && !verifyForward(remaining())) {
+            logger.debug("ArkWeb device forward not verified")
+            close()
+            return null
+        }
+        if (active == null) {
+            close()
+            val path = discoverPage(remaining())
+            if (path == null) {
+                logger.debug("ArkWeb page discovery did not confirm a unique loopback target")
+                return null
+            }
+            active = Connection()
+            active.socket = client.newWebSocket(Request.Builder().url("ws://$endpoint$path").build(), active)
+            connection = active
+        }
+        val (left, top, right, bottom) = bounds
+        val capture = "$script; maestro.viewportX = $left; maestro.viewportY = $top;" +
+            " maestro.viewportWidth = ${right - left}; maestro.viewportHeight = ${bottom - top};" +
+            " JSON.stringify(window.maestro.getContentDescription(), window.maestro.cycleSafeReplacer());"
+        val expression = if (target == null) capture else {
+            val url = json.writeValueAsString(target.pageUrl)
+            val webViewId = json.writeValueAsString(target.webViewId)
+            "if (window.location.href === $url && " +
+                "document.querySelector('meta[name=maestro-webview-id]')?.content === $webViewId) { $capture } else { null; }"
+        }
+        val id = ++sequence
+        val payload = json.writeValueAsString(mapOf("id" to id, "method" to "Runtime.evaluate",
+            "params" to mapOf("expression" to expression, "returnByValue" to true)))
+        val pending = Pending(id, CompletableFuture())
+        active.pending.set(pending)
+        return try {
+            check(!active.failed && active.socket.send(payload)) { "Could not send ArkWeb snapshot request" }
+            val snapshot = pending.result.get(remaining().toNanos(), TimeUnit.NANOSECONDS)
+            if (snapshot.isEmpty() || snapshot == "null") {
+                logger.debug("ArkWeb page returned no verified DOM snapshot")
+                close()
+                null
+            } else json.readValue(snapshot, TreeNode::class.java)
+        } catch (error: Exception) {
+            close()
+            throw error
+        } finally {
+            active.pending.compareAndSet(pending, null)
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        connection?.socket?.cancel()
+        connection = null
+    }
+
+    private data class Pending(val id: Long, val result: CompletableFuture<String>)
+
+    private class Connection : WebSocketListener() {
+        lateinit var socket: WebSocket
+        val openedAt = System.nanoTime()
+        val pending = AtomicReference<Pending?>()
+        @Volatile var failed = false
+            private set
+
+        override fun onMessage(webSocket: WebSocket, text: String) {
+            val current = pending.get() ?: return
+            try {
+                check(text.length <= MAX_JSON_BYTES) { "ArkWeb snapshot exceeds size limit" }
+                val message = json.readTree(text)
+                if (message.path("id").asLong() == current.id) {
+                    current.result.complete(message.path("result").path("result").path("value").asText())
+                }
+            } catch (error: Exception) {
+                current.result.completeExceptionally(error)
+            }
+        }
+
+        override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            onFailure(webSocket, IllegalStateException("ArkWeb closed the page connection"), null)
+            webSocket.cancel()
+        }
+
+        override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            failed = true
+            pending.get()?.result?.completeExceptionally(t)
+        }
+    }
+
+    private companion object {
+        val FORWARD_TTL_NANOS = TimeUnit.SECONDS.toNanos(5)
+        const val MAX_JSON_BYTES = 4L * 1024 * 1024
+        val client = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).followRedirects(false).build()
+        val json = jacksonObjectMapper()
+        val script: String by lazy {
+            requireNotNull(ArkWebLoopback::class.java.getResourceAsStream("/maestro-web.js")).bufferedReader().use { it.readText() }
+        }
+    }
+}

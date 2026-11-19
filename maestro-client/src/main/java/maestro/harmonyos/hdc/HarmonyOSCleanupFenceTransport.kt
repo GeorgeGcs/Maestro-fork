@@ -53,6 +53,7 @@ class HarmonyOSCleanupFenceTransport(private val hdc: HdcClient, private val cal
         /** Also used when validating immutable snapshots; opening the real journal validates its full schema. */
         fun scope(node: JsonNode): CleanupFenceScope {
             require(node["version"].asInt() == 1 && node["sealed"].asBoolean() && !node["rootRemoved"].asBoolean())
+            require(!node.has("layoutForward")) { "Cleanup fences cannot release an owned UITest forward." }
             val owner = node["ownerId"].asText(); val generation = node["generation"].asText()
             require(uuid.matches(owner) && uuid.matches(generation))
             val device = node["deviceId"].asText()

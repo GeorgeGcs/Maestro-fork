@@ -195,6 +195,7 @@ class TestSuiteInteractor(
                     maestro = maestro,
                     artifactsDir = flowDir,
                     captureFullArtifacts = captureFullArtifacts,
+                    captureStepEvidence = agentReport?.interactive != null,
                     listeners = listOfNotNull(CliConsoleListener(shardPrefix), agentObserver),
                     onCommandStart = { index, command -> agentObserver?.starting(command, index) },
                     onCommandFailed = { _, _, _ -> Orchestra.ErrorResolution.FAIL },

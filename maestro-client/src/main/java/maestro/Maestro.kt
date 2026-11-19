@@ -391,6 +391,11 @@ class Maestro(
     ) {
         recentScroll = false // consume the scroll hint (MA-4135)
 
+        if (driver is maestro.drivers.HarmonyOSDriver && !retryIfNoChange) {
+            hierarchyBasedTap(x, y, false, longPress, initialHierarchy, tapRepeat, waitToSettleTimeoutMs)
+            return
+        }
+
         val capabilities = runInterruptible(Dispatchers.IO) { driver.capabilities() }
 
         if (Capability.FAST_HIERARCHY in capabilities) {
@@ -411,7 +416,7 @@ class Maestro(
     ) {
         LOGGER.info("Tapping at ($x, $y) using hierarchy based logic for wait")
 
-        val hierarchyBeforeTap = initialHierarchy ?: viewHierarchy()
+        val hierarchyBeforeTap = if (retryIfNoChange) initialHierarchy ?: viewHierarchy() else null
 
         val retries = getNumberOfRetries(retryIfNoChange)
         repeat(retries) {

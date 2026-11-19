@@ -3,6 +3,7 @@ package maestro.harmonyos.driver
 import maestro.TreeNode
 import maestro.ScreenRecording
 import okio.Sink
+import java.nio.file.Path
 import java.time.Duration
 
 /** Device boundary; tests replace the transport while keeping the real Maestro driver. */
@@ -10,6 +11,16 @@ interface HarmonyOSDevice {
     fun connect()
     fun disconnect() {}
     fun isAvailable(): Boolean
+    fun hasAppFocus(appId: String, timeout: Duration): Boolean = true
+    fun keyboardVisible(timeout: Duration): Boolean =
+        throw UnsupportedOperationException("Keyboard visibility is not available for this backend.")
+    fun previewFrame(timeout: Duration): ByteArray = screenshot(timeout)
+    fun displaySize(timeout: Duration): Pair<Int, Int>? = null
+    fun setDisplayRotation(rotation: Int, timeout: Duration): Unit =
+        throw UnsupportedOperationException("This HarmonyOS device backend does not support rotation control.")
+    fun addMedia(files: List<Path>, timeout: Duration): Unit =
+        throw UnsupportedOperationException("This HarmonyOS device backend does not support media import.")
+    fun flowFaults(appId: String, startMs: Long, endMs: Long, timeout: Duration): HarmonyOSFlowFaults? = null
     fun hierarchy(timeout: Duration): TreeNode
     fun screenshot(timeout: Duration): ByteArray
     fun execute(arguments: List<String>, timeout: Duration): String

@@ -136,7 +136,7 @@ internal class ArtifactCollector(artifactsDir: Path) {
     fun artifactsForStep(sequenceNumber: Int): List<CommandArtifact> =
         records.filter { it.sequenceNumber == sequenceNumber && it.fileExists() }
             .distinctBy { it.relativePath }
-            .map { CommandArtifact(it.kind, it.relativePath) }
+            .map { CommandArtifact(it.kind, it.relativePath, it.metadata["phase"]) }
 
     /** Collection kinds folded to one folder entry with a member count; everything else 1:1. */
     fun manifest(): ArtifactManifest {

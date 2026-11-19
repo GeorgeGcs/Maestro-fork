@@ -222,7 +222,7 @@ internal object HarmonyOsRecoverySupport {
                     throw invalidMetadata("The resource journal does not belong to the gated device session.", ownerId)
                 }
                 try {
-                    val readiness = journal.recover(hdc, remaining(), cleanupResources = false)
+                    val readiness = journal.recover(hdc, remaining(), cleanupResources = false, cleanupForward = true)
                     val resources = journal.recordings
                     if (readiness.issues.any { it.code != "OWNED_RESOURCES_REMAIN" }) return@use readiness
                     val recordingIssues = resources?.recover(hdc, journal, remaining(),

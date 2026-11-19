@@ -74,6 +74,8 @@ object MaestroSessionManager {
         reinstallDriver: Boolean = true,
         deviceIndex: Int? = null,
         executionPlan: WorkspaceExecutionPlanner.ExecutionPlan? = null,
+        harmonyOsRunId: String? = null,
+        harmonyOsAttemptId: String? = null,
         block: (MaestroSession) -> T,
     ): T {
         val selectedPlatform = platform?.takeIf { it.isNotEmpty() }?.let { Platform.fromString(it) }
@@ -82,7 +84,9 @@ object MaestroSessionManager {
                 host, port, driverHostPort, teamId, deviceIndex, isStudio, isHeadless, screenSize,
             )
             val target = HarmonyOsSessionSupport.selectDevice(deviceId)
-            return HarmonyOsSessionSupport.withSession(target, block = block)
+            val ciAttempt = if (harmonyOsRunId != null && harmonyOsAttemptId != null)
+                HarmonyOsDevicePool.CiAttempt(harmonyOsRunId, harmonyOsAttemptId) else null
+            return HarmonyOsSessionSupport.withSession(target, ciAttempt = ciAttempt, block = block)
         }
         val selectedDevice = selectDevice(
             host = host,

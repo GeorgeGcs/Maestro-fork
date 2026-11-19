@@ -1,6 +1,7 @@
 package maestro.harmonyos.layout
 
 import com.google.common.truth.Truth.assertThat
+import com.fasterxml.jackson.databind.ObjectMapper
 import maestro.harmonyos.driver.HdcHarmonyOSDevice
 import maestro.harmonyos.hdc.HdcClient
 import maestro.harmonyos.hdc.HdcCommandResult
@@ -73,6 +74,73 @@ class LayoutBackendTest {
     }
 
     private fun listener() = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 4000 }
+
+    @Test
+    fun `rotation is sent once and read back before success`() {
+        listener().use { server ->
+            val device = HdcFixture(server.localPort).device()
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val peer = executor.submit {
+                    server.accept().use { socket ->
+                        socket.soTimeout = 3000
+                        val mapper = ObjectMapper()
+                        fun reply(api: String, result: String, rotation: Int? = null) {
+                            val request = mapper.readTree(receiveLayoutFrame { socket.getInputStream().read() })
+                            check(request.path("params").path("api").asText() == api)
+                            if (rotation != null) check(request.path("params").path("args").get(0).asInt() == rotation)
+                            val id = request.path("request_id").asText()
+                            socket.getOutputStream().write("""{"request_id":"$id","result":$result}""".toByteArray())
+                        }
+                        reply("Driver.create", "\"Driver#1\"")
+                        reply("Driver.getDisplayRotation", "0")
+                        reply("Driver.setDisplayRotation", "null", 1)
+                        reply("Driver.getDisplayRotation", "1")
+                    }
+                }
+                device.connect()
+                device.setDisplayRotation(1, budget)
+                peer.get(5, TimeUnit.SECONDS)
+            } finally {
+                device.disconnect()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun `the verified socket serves live display dimensions and layouts`() {
+        listener().use { server ->
+            val device = HdcFixture(server.localPort).device()
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val peer = executor.submit {
+                    server.accept().use { socket ->
+                        socket.soTimeout = 3000
+                        val input = socket.getInputStream()
+                        val output = socket.getOutputStream()
+                        fun respond(api: String, result: String) {
+                            val request = String(receiveLayoutFrame { input.read() })
+                            check(request.contains(api))
+                            output.write("""{"result":$result}""".toByteArray())
+                        }
+                        respond("Driver.create", "\"Driver#1\"")
+                        respond("Driver.getDisplaySize", """{"x":1260,"y":2720}""")
+                        respond("captureLayout", """{"attributes":{"text":"RPC"},"children":[]}""")
+                        respond("Driver.getDisplaySize", """{"x":2720,"y":1260}""")
+                    }
+                }
+                device.connect()
+                assertThat(device.displaySize(budget)).isEqualTo(1260 to 2720)
+                assertThat(device.hierarchy(budget).attributes["text"]).isEqualTo("RPC")
+                assertThat(device.displaySize(budget)).isEqualTo(2720 to 1260)
+                peer.get(5, TimeUnit.SECONDS)
+            } finally {
+                device.disconnect()
+                executor.shutdownNow()
+            }
+        }
+    }
 
     private inner class HdcFixture(private val port: Int, private val owner: String = deviceId) {
         var dumps = 0

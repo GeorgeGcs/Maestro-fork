@@ -1,5 +1,6 @@
 package maestro.harmonyos.layout
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import maestro.TreeNode
 import maestro.harmonyos.hdc.HdcException
@@ -15,7 +16,7 @@ import java.net.SocketTimeoutException
 import java.net.ConnectException
 import java.time.Duration
 
-/** Read-only UITest layout RPC over a separately managed loopback forward. */
+/** UITest operations over a separately managed loopback forward. */
 internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
     private val mapper = ObjectMapper()
     private val layouts = UitestLayoutParser()
@@ -23,6 +24,7 @@ internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
     private var input: BufferedInputStream? = null
     private var readDeadlineNanos = 0L
     private var sequence = 0L
+    private var driverRef: String? = null
     private val logger = org.slf4j.LoggerFactory.getLogger(LoopbackLayoutChannel::class.java)
 
     @Synchronized
@@ -42,6 +44,67 @@ internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
     }
 
     private fun request(timeout: Duration): TreeNode {
+        val layout = exchange("Captures", mapOf("api" to "captureLayout", "args" to emptyMap<String, String>()), timeout)
+        return try {
+            val tree = layouts.parse(if (layout.isTextual) layout.asText() else layout.toString())
+            remainingMillis()
+            tree
+        } catch (error: SocketTimeoutException) {
+            close()
+            throw HdcTimeoutException(timeout, "UITest layout RPC exceeded its read deadline")
+        } catch (error: UitestLayoutException) {
+            close()
+            throw error
+        }
+    }
+
+    @Synchronized
+    fun displaySize(timeout: Duration): Pair<Int, Int> {
+        readDeadlineNanos = System.nanoTime() + timeout.toNanos()
+        try {
+            val size = driverCall("Driver.getDisplaySize", emptyList(), timeout)
+            val width = size.path("x").asInt()
+            val height = size.path("y").asInt()
+            if (width <= 0 || height <= 0 || width.toLong() * height > 16_000_000) {
+                throw HdcException("UITest returned invalid display dimensions")
+            }
+            return width to height
+        } catch (error: EOFException) {
+            throw HdcException("UITest closed the display-size connection", error)
+        }
+    }
+
+    @Synchronized
+    fun displayRotation(timeout: Duration): Int {
+        readDeadlineNanos = System.nanoTime() + timeout.toNanos()
+        val value = rotationCall("Driver.getDisplayRotation", emptyList(), timeout)
+        if (!value.isIntegralNumber || value.asInt(-1) !in 0..3) {
+            throw HdcException("UITest did not return a valid display rotation.")
+        }
+        return value.asInt()
+    }
+
+    @Synchronized
+    fun setDisplayRotation(rotation: Int, timeout: Duration) {
+        readDeadlineNanos = System.nanoTime() + timeout.toNanos()
+        rotationCall("Driver.setDisplayRotation", listOf(rotation), timeout)
+    }
+
+    private fun rotationCall(api: String, arguments: List<Any>, timeout: Duration): JsonNode =
+        try { driverCall(api, arguments, timeout) } catch (_: EOFException) {
+            // A mutation is never replayed after disconnect.
+            throw HdcException("UITest closed the display-rotation connection.")
+        }
+
+    private fun driverCall(api: String, arguments: List<Any>, timeout: Duration): JsonNode {
+        fun call(method: String, receiver: String?, args: List<Any>): JsonNode = exchange(
+            "callHypiumApi", mapOf("api" to method, "this" to receiver, "args" to args, "message_type" to "hypium"), timeout)
+        val receiver = driverRef ?: call("Driver.create", null, emptyList()).takeIf(JsonNode::isTextual)?.asText()
+            ?.takeIf(String::isNotBlank)?.also { driverRef = it } ?: throw HdcException("UITest returned no driver reference")
+        return call(api, receiver, arguments)
+    }
+
+    private fun exchange(method: String, params: Map<String, Any?>, timeout: Duration): JsonNode {
         try {
             val socket = connection ?: Socket().also {
                 connection = it
@@ -57,8 +120,8 @@ internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
             val id = (++sequence).toString()
             socket.getOutputStream().write(mapper.writeValueAsBytes(mapOf(
                 "module" to "com.ohos.devicetest.hypiumApiHelper",
-                "method" to "Captures",
-                "params" to mapOf("api" to "captureLayout", "args" to emptyMap<String, String>()),
+                "method" to method,
+                "params" to params,
                 "request_id" to id,
             )))
             val source = checkNotNull(input)
@@ -71,10 +134,8 @@ internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
             if ((responseId != null && !responseId.isNull && responseId.asText() != id) ||
                 result.get("exception")?.let { !it.isNull && !(it.isTextual && it.asText().isEmpty()) } == true
             ) throw HdcException("UITest layout RPC returned an error or a mismatched request ID")
-            val layout = result.get("result") ?: throw HdcException("UITest layout RPC returned no tree")
-            val tree = layouts.parse(if (layout.isTextual) layout.asText() else layout.toString())
             remainingMillis()
-            return tree
+            return result.get("result") ?: throw HdcException("UITest RPC returned no result")
         } catch (error: Exception) {
             close()
             when (error) {
@@ -99,6 +160,7 @@ internal class LoopbackLayoutChannel(private val port: Int) : AutoCloseable {
         try { connection?.close() } catch (_: IOException) { /* Socket is no longer usable. */ }
         connection = null
         input = null
+        driverRef = null
     }
 }
 

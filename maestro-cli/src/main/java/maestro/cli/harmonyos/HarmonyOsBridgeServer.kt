@@ -29,7 +29,7 @@ internal class RecorderError(val code: String, message: String) : RuntimeExcepti
 internal data class RecorderConfig(
     val deviceId: String,
     val appId: String,
-    val abilityName: String,
+    val abilityName: String?,
     val moduleName: String?,
     val artifactsDir: Path,
     val sessionId: String? = null,
@@ -247,7 +247,7 @@ internal fun parseRecorderConfig(parameters: JsonNode): RecorderConfig {
     val artifactPath = Path.of(parameters.requiredText("artifactsDir"))
     if (!artifactPath.isAbsolute) throw RecorderError("INVALID_PARAMS", "artifactsDir must be an absolute path.")
     val config = RecorderConfig(parameters.requiredText("deviceId"), parameters.requiredText("appId"),
-        parameters.requiredText("abilityName"), parameters.optionalText("moduleName"), artifactPath.normalize())
+        parameters.optionalText("abilityName"), parameters.optionalText("moduleName"), artifactPath.normalize())
     if (!config.deviceId.matches(Regex("[A-Za-z0-9][A-Za-z0-9._:-]*"))) {
         throw RecorderError("INVALID_PARAMS", "Invalid device identifier.")
     }

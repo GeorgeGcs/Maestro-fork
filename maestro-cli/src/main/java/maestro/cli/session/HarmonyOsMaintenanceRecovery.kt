@@ -373,6 +373,7 @@ internal class HarmonyOsMaintenanceRecovery(
         private fun requireScope(node: JsonNode, gate: LeaseGate) {
             require(node["version"].asInt() == 1 && node["deviceId"].asText() == gate.deviceId && node["ownerId"].asText() == gate.ownerId)
             require(node["sealed"].isBoolean && node["sealed"].booleanValue())
+            require(!node.has("layoutForward")) { "Resolve the UITest forward through normal recovery before maintenance." }
             maintenanceTemporaryPaths(node)
             require(node["operations"].isArray && node["operations"].all { it["completed"].booleanValue() || it["recoverable"].booleanValue() })
             require(pendingIds(node).isNotEmpty()) { "Maintenance is only for pending finite commands." }

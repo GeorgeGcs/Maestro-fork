@@ -253,6 +253,7 @@ internal class HarmonyOsCleanupFenceRecovery(
         private fun validateCallsJournal(node: JsonNode, cp: CleanupFenceCheckpoint, step: CleanupFenceStep, requireStopped: Boolean) {
             require(node["version"].asInt() == 1 && node["deviceId"].asText() == cp.deviceId && node["ownerId"].asText() == cp.recoveryId &&
                 node["sealed"].asBoolean() && node["rootRemoved"].asBoolean() && node["operations"].isEmpty && node["temporaryFiles"].isEmpty)
+            require(!node.has("layoutForward"))
             val calls = node["hostCalls"].toList()
             require(calls.map { it["id"].asText() } == step.calls.map { it.call.hostCallId }) { "Unbound recovery invocation." }
             require(calls.map { it["id"].asText() }.distinct().size == calls.size)

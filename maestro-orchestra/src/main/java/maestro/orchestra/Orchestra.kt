@@ -20,7 +20,9 @@
 package maestro.orchestra
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -38,10 +40,15 @@ import maestro.MaestroException
 import maestro.device.AppCrashReport
 import maestro.device.Platform
 import maestro.Point
+import maestro.TreeNode
 import maestro.ScreenRecording
 import maestro.UiElement
 import maestro.UiElement.Companion.toUiElementOrNull
 import maestro.ViewHierarchy
+import maestro.drivers.HarmonyOSDriver
+import maestro.harmonyos.hdc.HdcException
+import maestro.harmonyos.hdc.HdcTimeoutException
+import java.util.concurrent.TimeUnit
 import maestro.ai.cloud.Defect
 import maestro.ai.CloudAIPredictionEngine
 import maestro.ai.AIPredictionEngine
@@ -53,10 +60,12 @@ import maestro.orchestra.debug.ArtifactsGenerator
 import maestro.orchestra.debug.BundleLayout
 import maestro.orchestra.debug.ArtifactCollector
 import maestro.orchestra.debug.CommandOutcome
+import maestro.orchestra.debug.ElementWaitObservation
 import maestro.orchestra.debug.ExecutionContext
 import maestro.orchestra.debug.ExecutionEvent
 import maestro.orchestra.debug.ExecutionTraceArtifacts
 import maestro.orchestra.debug.ExecutionTraceEnd
+import maestro.orchestra.debug.HarmonyOSFaultInspection
 import maestro.orchestra.debug.RetryExecutionEvent
 import maestro.orchestra.debug.RetryExecutionFrame
 import maestro.orchestra.debug.FlowDebugOutput
@@ -162,6 +171,7 @@ class Orchestra(
     private val onCommandReset: (MaestroCommand) -> Unit = {},
     private val onCommandMetadataUpdate: (MaestroCommand, CommandMetadata) -> Unit = { _, _ -> },
     private val onStepScreenshotCaptured: (sequenceNumber: Int, relativePath: String) -> Unit = { _, _ -> },
+    private val captureStepEvidence: Boolean = false,
     private val onCommandGeneratedOutput: (command: Command, defects: List<Defect>, screenshot: Buffer) -> Unit = { _, _, _ -> },
     private val apiKey: String? = null,
     private val AIPredictionEngine: AIPredictionEngine? = apiKey?.let { CloudAIPredictionEngine(it) },
@@ -183,6 +193,14 @@ class Orchestra(
     private var copiedText: String? = null
 
     private var timeMsOfLastInteraction = System.currentTimeMillis()
+    private var screenshotNanosAtLastInteraction = 0L
+    private data class AssertionSample(val hierarchy: ViewHierarchy, val readAt: Long)
+    private var assertionSample: AssertionSample? = null
+    private var harmonyDeviceFailure: HdcException? = null
+
+    private fun rememberHarmonyDeviceFailure(error: Throwable) {
+        if (error is HdcException && harmonyDeviceFailure !is HdcTimeoutException) harmonyDeviceFailure = error
+    }
 
     private var screenRecording: ScreenRecording? = null
 
@@ -191,7 +209,7 @@ class Orchestra(
     // ArtifactsGenerator is always the first listener: it writes the bundle when
     // artifactsDir is set and populates debugOutput either way.
     private val artifactsGenerator: ArtifactsGenerator =
-        ArtifactsGenerator(artifactsDir, maestro, captureFullArtifacts, onStepScreenshotCaptured)
+        ArtifactsGenerator(artifactsDir, maestro, captureFullArtifacts, onStepScreenshotCaptured, captureStepEvidence)
     private val effectiveListeners: List<OrchestraListener> = listOf(artifactsGenerator) + listeners
 
     private var commandSequenceCounter: Int = 0
@@ -207,13 +225,17 @@ class Orchestra(
         val command: MaestroCommand,
         val context: ExecutionContext,
         var terminal: Boolean = false,
+        val elementWaits: MutableList<ElementWaitObservation> = mutableListOf(),
     )
     private val executingCommands = ArrayDeque<ExecutingCommand>()
     private val retryFrames = ArrayDeque<RetryExecutionFrame>()
     private var traceSequence = 0L
     private val traceStartedNanos = System.nanoTime()
+    private val traceStartedWallMs = System.currentTimeMillis()
+    private var faultInspection: HarmonyOSFaultInspection? = null
 
-    private fun traceEvent() = ExecutionEvent(traceSequence++, System.nanoTime() - traceStartedNanos)
+    private fun traceEvent(elementWaits: List<ElementWaitObservation> = emptyList()) =
+        ExecutionEvent(traceSequence++, System.nanoTime() - traceStartedNanos, elementWaits)
     private fun <T> immutable(values: Collection<T>): List<T> = Collections.unmodifiableList(ArrayList(values))
 
     data class FlowResult(
@@ -245,6 +267,7 @@ class Orchestra(
     }
 
     suspend fun runFlow(commands: List<MaestroCommand>): FlowResult {
+        faultInspection = null
         var result: FlowResult? = null
         var failure: Throwable? = null
         try {
@@ -256,14 +279,19 @@ class Orchestra(
             val event = traceEvent()
             val completionSequence = traceSequence++
             val end = ExecutionTraceEnd(event, completionSequence, traceSequence,
-                commandSequenceCounter - 1, executingCommands.size, retryFrames.size, result?.success, failure)
+                commandSequenceCounter - 1, executingCommands.size, retryFrames.size, result?.success, failure, faultInspection)
             dispatch("onExecutionTraceEnd") { it.onExecutionTraceEnd(end) }
         }
     }
 
     private suspend fun runObservedFlow(commands: List<MaestroCommand>): FlowResult {
         val flowStartMs = System.currentTimeMillis()
-        timeMsOfLastInteraction = System.currentTimeMillis()
+        markInteraction()
+        assertionSample = null
+        harmonyDeviceFailure = null
+        artifactsGenerator.appUnderTest = null
+        artifactsGenerator.appCrashReport = null
+        artifactsGenerator.appFreezeReport = null
 
         val config = YamlCommandReader.getConfig(commands)
 
@@ -351,7 +379,44 @@ class Orchestra(
 
             jsEngine.close()
 
-            val crash = findAppCrash(flowStartMs)
+            val flowFailed = exception != null || !(onCompleteSuccess && flowSuccess)
+            val cause = exception ?: bodyFailure ?: completionFailure
+            val harmony = maestro.driver as? HarmonyOSDriver
+            artifactsGenerator.collectDriverCrashArtifacts = harmony == null
+            val crash = if (harmony == null) findAppCrash(flowStartMs) else {
+                val app = artifactsGenerator.appUnderTest
+                val endMs = System.currentTimeMillis()
+                val deviceFailure = harmonyDeviceFailure
+                val faults = if (app != null && endMs >= flowStartMs &&
+                    (flowFailed || deviceFailure != null || harmony.strictFaultDiagnostics) &&
+                    cause !is CancellationException && cause !is HdcTimeoutException &&
+                    deviceFailure !is HdcTimeoutException && currentCoroutineContext().isActive
+                ) {
+                    try {
+                        val captured = runInterruptible(Dispatchers.IO) { harmony.flowFaults(app, flowStartMs, endMs) }
+                        val estimatedWallMs = traceStartedWallMs + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - traceStartedNanos)
+                        val stableEpoch = traceStartedWallMs.takeIf {
+                            kotlin.math.abs(System.currentTimeMillis() - estimatedWallMs) <= 10
+                        }
+                        faultInspection = HarmonyOSFaultInspection(app,
+                            if (captured == null) "unavailable" else "complete", captured, stableEpoch)
+                        captured
+                    } catch (error: CancellationException) {
+                        exception = error
+                        null
+                    } catch (error: Exception) {
+                        logger.warn("Could not collect HarmonyOS fault diagnostics for $app", error)
+                        faultInspection = HarmonyOSFaultInspection(app, if (error is HdcTimeoutException) "timedOut" else "unavailable")
+                        null
+                    }
+                } else null
+                artifactsGenerator.appFreezeReport = faults?.freeze?.let {
+                    AppCrashReport(it.message, it.diagnosticText())
+                }
+                faults?.crash?.let {
+                    AppCrashReport(it.message, it.diagnosticText())
+                }
+            }
             artifactsGenerator.appCrashReport = crash // saved into the bundle with the other artifacts
 
             dispatch("onFlowEnd") { it.onFlowEnd() }
@@ -360,9 +425,8 @@ class Orchestra(
 
             // A failed flow whose app crashed failed because of the crash. This is the one place the
             // crash is raised; the failing command's own error rides along.
-            val flowFailed = exception != null || !(onCompleteSuccess && flowSuccess)
-            if (crash != null && flowFailed) {
-                throw MaestroException.AppCrash(crash.message).also { appCrash -> exception?.let(appCrash::addSuppressed) }
+            if (crash != null && (flowFailed || harmony?.strictFaultDiagnostics == true)) {
+                throw MaestroException.AppCrash(crash.message).also { appCrash -> cause?.let(appCrash::addSuppressed) }
             }
 
             exception?.let { throw it }
@@ -467,6 +531,7 @@ class Orchestra(
                 } catch (e: DeviceConnectionException) {
                     throw e
                 } catch (e: Throwable) {
+                    rememberHarmonyDeviceFailure(e)
                     logger.error("[Command execution] CommandFailed: ${e.message}")
                     dispatchFinished(command, CommandOutcome.Failed(e), sequenceNumber)
                     val errorResolution = onCommandFailed(index, command, e)
@@ -504,6 +569,7 @@ class Orchestra(
      */
     private suspend fun executeCommand(maestroCommand: MaestroCommand, config: MaestroConfig?): Boolean {
         val command = maestroCommand.asCommand()
+        if (command !is AssertConditionCommand) assertionSample = null
 
         flowController.waitIfPaused()
 
@@ -568,7 +634,7 @@ class Orchestra(
             else -> true
         }.also { mutating ->
             if (mutating) {
-                timeMsOfLastInteraction = System.currentTimeMillis()
+                markInteraction()
             }
         }
     }
@@ -632,6 +698,9 @@ class Orchestra(
     }
 
     private suspend fun assertConditionCommand(command: AssertConditionCommand): Boolean {
+        val previous = assertionSample
+        assertionSample = null
+        val condition = command.condition
         val timeout = (command.timeoutMs() ?: lookupTimeoutMs)
         val debugMessage = """
             Assertion '${command.condition.description()}' failed. Check the UI hierarchy in debug artifacts to verify the element state and properties.
@@ -641,7 +710,25 @@ class Orchestra(
             - Element may be temporarily unavailable due to loading state
             - This could be a real regression that needs to be addressed
         """.trimIndent()
-        if (!evaluateCondition(command.condition, timeoutMs = timeout, commandOptional = command.optional)) {
+        val shareHierarchy = maestro.driver is HarmonyOSDriver && condition.visible != null &&
+            condition.notVisible == null && condition.scriptCondition == null
+        val execution = executingCommands.lastOrNull()
+        if (!evaluateCondition(command.condition, timeoutMs = timeout, commandOptional = command.optional,
+                onVisibleAssertion = if (shareHierarchy) { selector, lookupTimeout ->
+                    val (_, filter) = buildFilter(selector)
+                    val cached = previous?.takeIf {
+                        System.nanoTime() - it.readAt <= TimeUnit.MILLISECONDS.toNanos(250) &&
+                            selector.childOf == null &&
+                            filter(it.hierarchy.aggregate()).firstOrNull()?.toUiElementOrNull() != null
+                    }
+                    assertionSample = cached ?: findElement(selector, command.optional, lookupTimeout).let {
+                        AssertionSample(it.hierarchy, System.nanoTime())
+                    }
+                } else null,
+                onElementWait = if (execution != null && maestro.driver is HarmonyOSDriver) { observation ->
+                    execution.elementWaits.add(observation)
+                } else null,
+            )) {
             throw MaestroException.AssertionFailure(
                 message = "Assertion is false: ${command.condition.description()}",
                 hierarchyRoot = maestro.viewHierarchy().root,
@@ -903,9 +990,10 @@ class Orchestra(
 
     private suspend fun clearAppStateCommand(command: ClearStateCommand): Boolean {
         maestro.clearAppState(command.appId)
-        // Android's clear command also resets permissions
-        // Reset all permissions to unset so both platforms behave the same
-        maestro.setPermissions(command.appId, mapOf("all" to "unset"))
+        // Keep Android and iOS permission handling consistent. HarmonyOS has no equivalent grant reset in the driver.
+        if (maestro.cachedDeviceInfo.platform != Platform.HARMONYOS) {
+            maestro.setPermissions(command.appId, mapOf("all" to "unset"))
+        }
 
         return true
     }
@@ -938,7 +1026,7 @@ class Orchestra(
         do {
             yield()
             try {
-                val element = findElement(command.selector, command.optional, 500).element
+                val element = findElement(command.selector, command.optional, 500, captureHierarchyOnFailure = false).element
                 val visibility = element.getVisiblePercentage(deviceInfo.widthGrid, deviceInfo.heightGrid)
 
                 logger.info("Scrolling try count: $retryCenterCount, DeviceWidth: ${deviceInfo.widthGrid}, DeviceWidth: ${deviceInfo.heightGrid}")
@@ -1154,7 +1242,7 @@ class Orchestra(
         val startedAt = commandStartTimes.remove(sequenceNumber) ?: finishedAt
         val frame = executingCommands.last { it.context.executionSequence == sequenceNumber }
         frame.terminal = true
-        val event = traceEvent()
+        val event = traceEvent(immutable(frame.elementWaits))
         dispatch("onCommandExecutionFinished") {
             it.onCommandExecutionFinished(command, frame.context, outcome, startedAt, finishedAt, event)
         }
@@ -1182,7 +1270,7 @@ class Orchestra(
             if (!frame.terminal) {
                 frame.terminal = true
                 commandStartTimes.remove(sequence)
-                val event = traceEvent()
+                val event = traceEvent(immutable(frame.elementWaits))
                 val finishedAt = System.currentTimeMillis()
                 dispatch("onCommandExecutionInterrupted") {
                     it.onCommandExecutionInterrupted(command, context, error, startedAt, finishedAt, event)
@@ -1220,6 +1308,8 @@ class Orchestra(
         condition: Condition?,
         commandOptional: Boolean,
         timeoutMs: Long? = null,
+        onVisibleAssertion: (suspend (ElementSelector, Long) -> Unit)? = null,
+        onElementWait: ((ElementWaitObservation) -> Unit)? = null,
     ): Boolean {
         if (condition == null) {
             return true
@@ -1256,19 +1346,24 @@ class Orchestra(
         }
 
         condition.visible?.let {
-            try {
-                findElement(
-                    selector = it,
-                    timeoutMs = adjustedToLatestInteraction(timeoutMs ?: optionalLookupTimeoutMs),
-                    optional = commandOptional,
-                )
+            val lookupTimeout = adjustedToLatestInteraction(timeoutMs ?: optionalLookupTimeoutMs)
+            val started = System.nanoTime()
+            val satisfied = try {
+                if (onVisibleAssertion != null) onVisibleAssertion(it, lookupTimeout)
+                else findElement(selector = it, timeoutMs = lookupTimeout, optional = commandOptional)
+                true
             } catch (_: MaestroException.ElementNotFound) {
-                return false
+                false
             }
+            onElementWait?.invoke(ElementWaitObservation("visible", lookupTimeout,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), satisfied))
+            if (!satisfied) return false
         }
 
         condition.notVisible?.let {
-            val disappeared = MaestroTimer.withTimeoutSuspend(adjustedToLatestInteraction(timeoutMs ?: optionalLookupTimeoutMs)) {
+            val lookupTimeout = adjustedToLatestInteraction(timeoutMs ?: optionalLookupTimeoutMs)
+            val started = System.nanoTime()
+            val disappeared = MaestroTimer.withTimeoutSuspend(lookupTimeout) {
                 try {
                     findElement(
                         selector = it,
@@ -1282,6 +1377,8 @@ class Orchestra(
                     true
                 }
             }
+            onElementWait?.invoke(ElementWaitObservation("notVisible", lookupTimeout,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), disappeared == true))
 
             if (disappeared != true) {
                 return false
@@ -1341,6 +1438,7 @@ class Orchestra(
                     } catch (e: DeviceConnectionException) {
                         throw e
                     } catch (e: Throwable) {
+                        rememberHarmonyDeviceFailure(e)
                         dispatchFinished(command, CommandOutcome.Failed(e), sequenceNumber)
                         when (onCommandFailed(index, command, e)) {
                             ErrorResolution.FAIL -> throw e
@@ -1631,6 +1729,7 @@ class Orchestra(
         selector: ElementSelector,
         optional: Boolean,
         timeoutMs: Long? = null,
+        captureHierarchyOnFailure: Boolean = true,
     ): FindElementResult {
         val timeout =
             timeoutMs ?: adjustedToLatestInteraction(
@@ -1701,7 +1800,7 @@ class Orchestra(
             filter = filterFunc
         ) ?: throw MaestroException.ElementNotFound(
             "Element not found: $description",
-            maestro.viewHierarchy().root,
+            if (captureHierarchyOnFailure) maestro.viewHierarchy().root else TreeNode(),
             debugMessage = exceptionDebugMessage
         )
     }
@@ -1971,10 +2070,17 @@ class Orchestra(
         return true
     }
 
-    private fun adjustedToLatestInteraction(timeMs: Long) = max(
-        0,
-        timeMs - (System.currentTimeMillis() - timeMsOfLastInteraction),
-    )
+    private fun markInteraction() {
+        timeMsOfLastInteraction = System.currentTimeMillis()
+        screenshotNanosAtLastInteraction = artifactsGenerator.supplementalScreenshotNanos
+    }
+
+    private fun adjustedToLatestInteraction(timeMs: Long): Long {
+        val supplementalMs = TimeUnit.NANOSECONDS.toMillis(artifactsGenerator.supplementalScreenshotNanos - screenshotNanosAtLastInteraction)
+        // Interactive diagnostic frames should not consume the next selector's lookup budget.
+        val elapsedMs = (System.currentTimeMillis() - timeMsOfLastInteraction - supplementalMs).coerceAtLeast(0)
+        return (timeMs - elapsedMs).coerceAtLeast(0)
+    }
 
     private suspend fun copyTextFromCommand(command: CopyTextFromCommand): Boolean {
         val result = findElement(command.selector, optional = command.optional)

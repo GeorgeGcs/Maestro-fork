@@ -101,8 +101,21 @@ class HarmonyOsAgentCapabilitiesTest {
         val probe = Probe()
         val recording = HarmonyOsAgentCapabilities(probe, false).preflight(mapper.readTree("""{"deviceId":"test-target","commands":["startRecording"]}"""))
         assertEquals("blocked", recording["readiness"])
-        assertEquals("blocked", preflight(probe, """{"deviceId":"test-target","commands":["openLink"]}""")["readiness"].asText())
+        assertEquals("blocked", preflight(probe, """{"deviceId":"test-target","commands":["setLocation"]}""")["readiness"].asText())
         assertTrue(probe.shell.all { it.first() == "which" })
+    }
+
+    @Test fun `clear state preflight distinguishes regular applications and atomic services without clearing data`() {
+        val probe = Probe().apply {
+            bundle = """{"name":"com.example.demo","applicationInfo":{"bundleType":0,"userDataClearable":true}}"""
+        }
+        val params = """{"deviceId":"test-target","commands":["clearState"],"appId":"com.example.demo"}"""
+        assertEquals("ready", preflight(probe, params)["readiness"].asText())
+        probe.bundle = probe.bundle.replace("\"bundleType\":0", "\"bundleType\":1")
+        val blocked = preflight(probe, params)
+        assertEquals("blocked", blocked["readiness"].asText())
+        assertTrue(blocked["checks"].any { it["code"].asText() == "DATA_CLEAR_TARGET_UNSUPPORTED" })
+        assertTrue(probe.shell.all { it.first() == "which" || it.take(2) == listOf("bm", "dump") })
     }
 
     @Test fun `lock probe neither creates files nor reserves device`() {

@@ -1,6 +1,7 @@
 package maestro.harmonyos.driver
 
 import java.time.Duration
+import java.nio.file.Path
 
 data class HarmonyOSDriverConfig(
     val abilityName: String? = null,
@@ -15,10 +16,20 @@ data class HarmonyOSDriverConfig(
     val recordingRetainMedia: Boolean = false,
     val layoutRpcPort: Int? = null,
     val layoutRpcDevice: String? = null,
+    val arkWebPort: Int? = null,
+    val arkWebBundle: String? = null,
+    val strictFaultDiagnostics: Boolean = false,
+    val arkWebTarget: HarmonyOSArkWebTarget? = null,
+    val automaticLayoutRpc: Boolean = false,
+    val hostRecordingFfmpeg: Path? = null,
 ) {
     init {
         require((layoutRpcPort == null) == (layoutRpcDevice == null)) { "Set both layout RPC port and target device" }
         layoutRpcPort?.let { require(it in 1024..65535) { "Layout RPC port must be 1024..65535" } }
+        require((arkWebPort == null) == (arkWebBundle == null)) { "Set both ArkWeb port and test bundle" }
+        require(arkWebTarget == null || arkWebPort != null) { "An explicit ArkWeb target requires a port and bundle" }
+        arkWebPort?.let { require(it in 1024..65535) { "ArkWeb port must be 1024..65535" } }
+        arkWebBundle?.let { requireIdentifier(it, "ArkWeb bundle") }
         for (timeout in listOf(commandTimeout, settleTimeout, pollInterval)) {
             require(timeout >= Duration.ofMillis(1) && timeout <= Duration.ofMinutes(5)) {
                 "HarmonyOS timeouts must be between 1 ms and 5 minutes"
@@ -33,8 +44,18 @@ data class HarmonyOSDriverConfig(
         }
         require(recordingMaxBytes in 1024..(1024L * 1024 * 1024)) { "Recording size limit must be between 1 KiB and 1 GiB" }
         require(!recordingRetainMedia || enableScreenRecording) { "Media retention requires explicitly enabled recording." }
+        require(hostRecordingFfmpeg == null || (hostRecordingFfmpeg.isAbsolute && !enableScreenRecording)) {
+            "Host recording requires an absolute FFmpeg path and is mutually exclusive with system recording."
+        }
         abilityName?.let { requireIdentifier(it, "Ability name") }
         moduleName?.let { requireIdentifier(it, "Module name") }
+    }
+}
+
+data class HarmonyOSArkWebTarget(val webViewId: String, val pageUrl: String) {
+    init {
+        requireIdentifier(webViewId, "ArkWeb WebView ID")
+        require(pageUrl.length in 1..2048 && pageUrl.none(Char::isISOControl)) { "Invalid ArkWeb page URL" }
     }
 }
 

@@ -49,6 +49,7 @@ internal class ArtifactsGenerator(
     private val maestro: Maestro,
     private val captureFullArtifacts: Boolean = false,
     private val onStepScreenshotCaptured: (sequenceNumber: Int, relativePath: String) -> Unit = { _, _ -> },
+    private val captureStepEvidence: Boolean = false,
 ) : OrchestraListener {
 
     val debugOutput = FlowDebugOutput()
@@ -62,6 +63,8 @@ internal class ArtifactsGenerator(
     private var fullRunRecordingFile: File? = null
     private var capturer: DeviceArtifactCapturer? = null
     private var flowStartMs: Long = 0L
+    var supplementalScreenshotNanos: Long = 0L
+        private set
 
     /**
      * The app crash/ANR reports are collected for. [Orchestra] sets it from the flow's `appId` once
@@ -71,6 +74,8 @@ internal class ArtifactsGenerator(
 
     /** The app's crash report, when [Orchestra] found one for this flow. Saved into the bundle at [onFlowEnd]. */
     internal var appCrashReport: AppCrashReport? = null
+    internal var appFreezeReport: AppCrashReport? = null
+    internal var collectDriverCrashArtifacts: Boolean = true
 
     /**
      * Artifacts are emitted synchronously by the currently-executing leaf
@@ -107,7 +112,11 @@ internal class ArtifactsGenerator(
         currentCommandMetadata = metadata
 
         // Pre-command shot: the screen the step is about to act on.
-        if (captureFullArtifacts && StepArtifactNaming.capturesScreenshot(cmd)) captureStepScreenshot(metadata)
+        if (captureStepEvidence && StepArtifactNaming.capturesHierarchy(cmd)) {
+            captureSupplementalScreenshot(metadata, "before", suffix = "-before")
+        } else if (captureFullArtifacts && StepArtifactNaming.capturesScreenshot(cmd)) {
+            captureStepScreenshot(metadata)
+        }
     }
 
     /**
@@ -168,6 +177,15 @@ internal class ArtifactsGenerator(
             }
         }
         if (artifactsDir == null || outcome is CommandOutcome.Skipped) return
+        if (captureStepEvidence && StepArtifactNaming.capturesHierarchy(cmd)) {
+            if (outcome is CommandOutcome.Failed || outcome is CommandOutcome.Warned) {
+                captureStepHierarchy(metadata)
+                captureStepScreenshotFile(metadata, if (outcome is CommandOutcome.Failed) "failure" else "after")
+            } else {
+                captureSupplementalScreenshot(metadata, "after")
+            }
+            return
+        }
         // Passing steps keep their pre-command shot from onCommandStart; nothing to do at finish.
         if (outcome !is CommandOutcome.Failed && outcome !is CommandOutcome.Warned) return
         // Non-visible leaves (defineVariables/applyConfiguration) and empty commands have no screen.
@@ -247,10 +265,11 @@ internal class ArtifactsGenerator(
         if (artifactsDir != null && collector != null) {
             // Device logs + crash/ANR land under logs/ and are adopted flow-level
             // (no owning command) so they appear in the manifest like any artifact.
-            capturer?.collect(appUnderTest, flowStartMs).orEmpty()
+            capturer?.collect(appUnderTest, flowStartMs, collectDriverCrashArtifacts).orEmpty()
                 .forEach { collector.adoptDeviceArtifact(it) }
             capturer = null
             appCrashReport?.let { collector.saveCrashReport(it) }
+            appFreezeReport?.let { collector.saveCrashReport(it, ArtifactKind.ANR_REPORT, DeviceArtifactFiles.ANR_REPORT) }
             artifactManifest = collector.manifest()
             try {
                 TestOutputWriter.saveManifest(artifactsDir, artifactManifest)
@@ -274,11 +293,15 @@ internal class ArtifactsGenerator(
         adopt(kind, "${BundleLayout.LOGS_DIR}/${captured.file.name}", ArtifactFormat.TXT, metadata)
     }
 
-    private fun ArtifactCollector.saveCrashReport(crash: AppCrashReport) {
+    private fun ArtifactCollector.saveCrashReport(
+        crash: AppCrashReport,
+        kind: ArtifactKind = ArtifactKind.CRASH_REPORT,
+        fileName: String = DeviceArtifactFiles.CRASH_REPORT,
+    ) {
         try {
-            val relativePath = "${BundleLayout.LOGS_DIR}/${DeviceArtifactFiles.CRASH_REPORT}"
+            val relativePath = "${BundleLayout.LOGS_DIR}/$fileName"
             artifactsDir!!.resolve(relativePath).toFile().apply { parentFile.mkdirs() }.writeText(crash.content)
-            adopt(ArtifactKind.CRASH_REPORT, relativePath, ArtifactFormat.TXT, mapOf("message" to crash.message))
+            adopt(kind, relativePath, ArtifactFormat.TXT, mapOf("message" to crash.message))
         } catch (e: Exception) {
             logger.warn("Failed to save the crash report under $artifactsDir", e)
         }
@@ -305,10 +328,20 @@ internal class ArtifactsGenerator(
         onStepScreenshotCaptured(metadata.sequenceNumber, relativePath)
     }
 
-    private fun captureStepScreenshotFile(metadata: CommandDebugMetadata): String? =
+    private fun captureSupplementalScreenshot(metadata: CommandDebugMetadata, phase: String, suffix: String = "") {
+        val started = System.nanoTime()
+        try {
+            captureStepScreenshotFile(metadata, phase, suffix)
+        } finally {
+            supplementalScreenshotNanos += System.nanoTime() - started
+        }
+    }
+
+    private fun captureStepScreenshotFile(metadata: CommandDebugMetadata, phase: String? = null, suffix: String = ""): String? =
         captureScreenshot(
-            "${BundleLayout.STEP_SCREENSHOTS_DIR}/${StepArtifactNaming.stem(metadata.sequenceNumber, metadata.command)}${BundleLayout.SCREENSHOT_EXTENSION}",
+            "${BundleLayout.STEP_SCREENSHOTS_DIR}/${StepArtifactNaming.stem(metadata.sequenceNumber, metadata.command)}$suffix${BundleLayout.SCREENSHOT_EXTENSION}",
             sequenceNumber = metadata.sequenceNumber,
+            phase = phase,
         )
 
     /** Flow-end shot of the resting screen — flow-level (owns no step). */
@@ -320,12 +353,13 @@ internal class ArtifactsGenerator(
      * Captures [relativePath] (via a sibling temp moved into place on success, so a failed recapture
      * never destroys a frame already there), returning the bundle-relative path or null on failure.
      */
-    private fun captureScreenshot(relativePath: String, sequenceNumber: Int?): String? {
+    private fun captureScreenshot(relativePath: String, sequenceNumber: Int?, phase: String? = null): String? {
         val collector = collector ?: return null
         val destFile = collector.allocate(
             ArtifactKind.SCREENSHOT,
             ArtifactFormat.PNG,
             relativePath,
+            metadata = if (phase == null) emptyMap() else mapOf("phase" to phase),
             sequenceNumber = sequenceNumber,
         )
         val tempFile = File(destFile.parentFile, "${destFile.name}.tmp")

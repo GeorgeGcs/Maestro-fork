@@ -1,13 +1,13 @@
 package maestro.cli.harmonyos
 
-import com.fasterxml.jackson.core.JsonParser
-import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import maestro.cli.session.HarmonyOsSessionSupport
+import maestro.harmonyos.driver.HarmonyOSBundleMetadata
 import maestro.harmonyos.driver.HdcHarmonyOSDevice
 import maestro.harmonyos.hdc.HdcClient
 import java.time.Duration
+import java.nio.file.Files
+import java.nio.file.Path
 
 /** Read-only observations; an implementation must never launch, unlock or change application state. */
 internal interface AgentEnvironmentProbe {
@@ -26,9 +26,8 @@ internal class HdcAgentEnvironmentProbe(private val hdc: HdcClient = HdcClient()
 internal class HarmonyOsAgentCapabilities(
     private val probe: AgentEnvironmentProbe = HdcAgentEnvironmentProbe(),
     private val recordingEnabled: Boolean = System.getenv("MAESTRO_HARMONYOS_RECORDING") == "huawei-system",
+    private val hostRecordingSelected: Boolean = System.getenv("MAESTRO_HARMONYOS_RECORDING") == "host-frames",
 ) {
-    private val mapper = jacksonObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
-        .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
     private data class Command(val name: String, val implementation: String, val recorder: Boolean = false,
         val screen: Boolean = true, val application: Boolean = false, val recording: Boolean = false)
 
@@ -42,7 +41,14 @@ internal class HarmonyOsAgentCapabilities(
                     if (command.screen) add("screen_unlocked")
                     if (command.application) add("app_installed")
                     if (command.name == "launchApp") add("ability_configured")
-                    if (command.recording) { add("recording_enabled"); add("recording_service_available"); add("recording_exclusive") }
+                    if (command.name == "setOrientation") add("uitest_rpc_available")
+                    if (command.name == "addMedia") add("gallery_import_available")
+                    if (command.recording) {
+                        add("recording_enabled")
+                        if (hostRecordingSelected) add("host_encoder_available") else {
+                            add("recording_service_available"); add("recording_exclusive")
+                        }
+                    }
                 },
                 "verification" to mapOf("state" to "unverified", "scope" to null, "evidenceRefs" to emptyList<String>()))
         },
@@ -77,8 +83,8 @@ internal class HarmonyOsAgentCapabilities(
         if (selected.any { it?.application == true } && appId == null) {
             check("application", "failed", "APP_ID_REQUIRED", "An application identifier is required for the requested command.")
         }
-        if ("launchApp" in requested && ability == null) {
-            check("ability", "failed", "ABILITY_REQUIRED", "An explicit launch ability is required.")
+        if ("launchApp" in requested && ability == null && appId == null) {
+            check("ability", "failed", "ABILITY_REQUIRED", "Provide an application identifier to discover its launch ability.")
         }
 
         val devices = try { probe.devices() } catch (error: Exception) {
@@ -111,23 +117,37 @@ internal class HarmonyOsAgentCapabilities(
             check("uitest", "passed", "UITEST_DISCOVERED", "UITest is discoverable; this does not verify every command.")
         } else check("uitest", "unknown", "PRECONDITION_UNKNOWN", "UITest availability was not confirmed by a read-only query.")
 
+        if ("setOrientation" in requested) check("rotationBackend", "unknown", "PRECONDITION_UNKNOWN",
+            "Rotation requires an active UITest RPC endpoint and a rotatable foreground application.")
+        if ("addMedia" in requested) {
+            val media = read(listOf("which", "mediatool"))
+            val available = media?.matches(Regex("/[^\\r\\n]+/mediatool")) == true
+            check("galleryTool", if (available) "passed" else "unknown",
+                if (available) "GALLERY_TOOL_DISCOVERED" else "PRECONDITION_UNKNOWN",
+                "Media tool discovery does not establish Gallery write access.")
+        }
+
         if (selected.any { it?.screen == true && it.implementation != "unsupported" }) {
             check("screenUnlocked", "unknown", "PRECONDITION_UNKNOWN",
                 "This implementation has no verified read-only lock-screen probe. Keep the device unlocked and inspect its current screen.")
         }
         if (appId != null) {
             val output = read(listOf("bm", "dump", "-n", appId))
-            val app = output?.let { text ->
-                try {
-                    val start = text.indexOf('{')
-                    if (start < 0) null else mapper.readTree(text.substring(start)).takeIf { it.isObject }
-                } catch (_: Exception) { null }
-            }
-            val names = listOf(app?.get("name"), app?.get("bundleName"), app?.path("appInfo")?.get("bundleName"),
-                app?.path("applicationInfo")?.get("bundleName"))
-            val confirmed = names.any { it?.isTextual == true && it.asText() == appId }
+            val app = output?.let { HarmonyOSBundleMetadata.parse(it, appId) }
+            val confirmed = app != null
             if (confirmed) check("application", "passed", "APP_DISCOVERED", "The bundle query identifies the requested application.")
             else check("application", "unknown", "PRECONDITION_UNKNOWN", "The application query did not confirm the requested bundle; absence was not inferred.")
+
+            if ("clearState" in requested) {
+                when (HarmonyOSBundleMetadata.dataClearSupport(app)) {
+                    HarmonyOSBundleMetadata.DataClearSupport.SUPPORTED -> check("clearStateTarget", "passed", "DATA_CLEAR_TARGET_CONFIRMED",
+                        "Bundle metadata declares a regular application with clearable user data.")
+                    HarmonyOSBundleMetadata.DataClearSupport.UNSUPPORTED -> check("clearStateTarget", "failed", "DATA_CLEAR_TARGET_UNSUPPORTED",
+                        "clearState requires a regular application with clearable user data.")
+                    HarmonyOSBundleMetadata.DataClearSupport.UNKNOWN -> check("clearStateTarget", "unknown", "PRECONDITION_UNKNOWN",
+                        "Bundle metadata did not confirm application type and data-clear support.")
+                }
+            }
 
             val modules = app?.get("hapModuleInfos")?.takeIf { it.isArray }?.toList().orEmpty()
             val matchingModules = if (module == null) modules else modules.filter {
@@ -147,9 +167,27 @@ internal class HarmonyOsAgentCapabilities(
                 val state = if (!confirmed || abilities.isEmpty()) "unknown" else if (present) "passed" else "failed"
                 check("ability", state, when (state) { "passed" -> "ABILITY_DISCOVERED"; "failed" -> "ABILITY_NOT_FOUND"; else -> "PRECONDITION_UNKNOWN" },
                     "Ability matching is limited to the confirmed bundle and requested module.")
+            } else if ("launchApp" in requested) {
+                val target = app?.let { HarmonyOSBundleMetadata.launchTarget(it, module) }
+                if (target != null) {
+                    check("ability", "passed", "ABILITY_AUTO_DISCOVERED", "The bundle declares ${target.abilityName} in ${target.moduleName}.")
+                } else if (app != null) {
+                    check("ability", "failed", "ABILITY_REQUIRED", "No unique launch ability was confirmed. Pass abilityName explicitly.")
+                } else {
+                    check("ability", "unknown", "PRECONDITION_UNKNOWN", "Launch ability discovery requires confirmed bundle metadata.")
+                }
             }
         }
-        if (selected.any { it?.recording == true }) {
+        if (selected.any { it?.recording == true } && hostRecordingSelected) {
+            val encoder = runCatching {
+                System.getenv("MAESTRO_HARMONYOS_FFMPEG")?.takeIf(String::isNotBlank)?.let(Path::of)
+            }.getOrNull()
+            val available = encoder != null && encoder.isAbsolute && Files.isRegularFile(encoder) && Files.isExecutable(encoder)
+            check("recordingEnabled", "passed", "RECORDING_ENABLED", "Host recording is configured.")
+            check("recordingTool", if (available) "passed" else "failed",
+                if (available) "HOST_ENCODER_CONFIGURED" else "HOST_ENCODER_REQUIRED",
+                "The host recording backend requires an absolute executable FFmpeg path.")
+        } else if (selected.any { it?.recording == true }) {
             check("recordingEnabled", if (recordingEnabled) "passed" else "failed",
                 if (recordingEnabled) "RECORDING_ENABLED" else "RECORDING_DISABLED", "The experimental recording backend requires explicit configuration.")
             val media = read(listOf("which", "mediatool"))
@@ -194,9 +232,9 @@ internal class HarmonyOsAgentCapabilities(
             Command("assertNotVisible", "supported"), Command("extendedWaitUntil", "supported"),
             Command("takeScreenshot", "supported", recorder = true, screen = false),
             Command("startRecording", "experimental", recording = true), Command("stopRecording", "experimental", recording = true),
-            Command("clearState", "unsupported"), Command("hideKeyboard", "unsupported"),
-            Command("openLink", "unsupported"), Command("addMedia", "unsupported"),
-            Command("setLocation", "unsupported"), Command("setOrientation", "unsupported"),
+            Command("clearState", "experimental", screen = false, application = true), Command("hideKeyboard", "unsupported"),
+            Command("openLink", "supported"), Command("addMedia", "experimental", screen = false),
+            Command("setLocation", "unsupported"), Command("setOrientation", "experimental"),
             Command("setPermissions", "unsupported"), Command("installApp", "unsupported"),
         )
     }

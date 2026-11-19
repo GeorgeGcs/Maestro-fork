@@ -83,7 +83,7 @@ class HarmonyOSQueryRecoveryTest {
                 failure = error
                 throw error
             }
-            check(listOf("dumpLayout", "screenCap", "rm").any(wrapper::contains))
+            check(listOf("dumpLayout", "screenCap", "DisplayManagerService", "rm").any(wrapper::contains))
             if (failure != null && wrapper.contains("rm")) cleanupAcknowledgements++
             val inner = Regex("MAESTRO_EXIT_[0-9a-f]{32}=").find(wrapper)?.value
             return HdcCommandResult(0, (inner?.let { "\n${it}0\n" } ?: "") + "\n${outer}0\n", "")

@@ -1,13 +1,18 @@
 package maestro.orchestra.debug
 
 import com.fasterxml.jackson.annotation.JsonIgnore
+import com.fasterxml.jackson.annotation.JsonInclude
 import maestro.MaestroException
 import maestro.orchestra.ArtifactKind
 import maestro.orchestra.MaestroCommand
 import java.util.IdentityHashMap
 
 /** One artifact a command produced: its kind plus the artifacts-folder-relative path. */
-data class CommandArtifact(val type: ArtifactKind, val path: String)
+data class CommandArtifact(
+    val type: ArtifactKind,
+    val path: String,
+    @get:JsonInclude(JsonInclude.Include.NON_NULL) val phase: String? = null,
+)
 
 data class CommandDebugMetadata(
     var status: CommandStatus? = null,

@@ -82,13 +82,14 @@ class HarmonyOSDriverTest {
     }
 
     @Test
-    fun `launch requires an explicit ability and validates arguments before starting app`() {
+    fun `launch requires discoverable metadata or an explicit ability`() {
         val device = Device()
         val driver = HarmonyOSDriver(device)
         driver.open()
         val missing = assertThrows(IllegalStateException::class.java) { driver.launchApp("org.example.demo", emptyMap()) }
         assertThat(missing.message).contains("MAESTRO_HARMONYOS_ABILITY")
-        assertThat(device.commands).isEmpty()
+        assertThat(device.commands).containsExactly(listOf("bm", "dump", "-n", "org.example.demo"))
+        device.commands.clear()
 
         val configured = driver(device)
         configured.open()
@@ -104,6 +105,35 @@ class HarmonyOSDriverTest {
     }
 
     @Test
+    fun `launch discovers the main ability in the entry module`() {
+        val device = Device()
+        device.bundleMetadata = """
+            org.example.demo:
+            {
+              "name": "org.example.demo",
+              "hapModuleInfos": [
+                {"moduleName":"feature","moduleType":2,"mainAbility":"FeatureAbility",
+                 "abilityInfos":[{"name":"FeatureAbility"}]},
+                {"moduleName":"entry","moduleType":1,"mainAbility":"MainAbility","mainElementName":"MainAbility",
+                 "abilityInfos":[{"name":"MainAbility","visible":true}]}
+              ]
+            }
+        """.trimIndent()
+        val driver = HarmonyOSDriver(device)
+        driver.open()
+        driver.launchApp("org.example.demo", emptyMap())
+        assertThat(device.commands).containsExactly(
+            listOf("bm", "dump", "-n", "org.example.demo"),
+            listOf("aa", "start", "-b", "org.example.demo", "-a", "MainAbility", "-m", "entry"),
+        ).inOrder()
+
+        device.commands.clear()
+        device.bundleMetadata = device.bundleMetadata.replace("\"moduleType\":2", "\"moduleType\":1")
+        assertThrows(IllegalStateException::class.java) { driver.launchApp("org.example.demo", emptyMap()) }
+        assertThat(device.commands).containsExactly(listOf("bm", "dump", "-n", "org.example.demo"))
+    }
+
+    @Test
     fun `aa must confirm success even when transport reports successful execution`() {
         val device = Device()
         val driver = driver(device)
@@ -113,6 +143,35 @@ class HarmonyOSDriverTest {
             driver.launchApp("org.example.demo", emptyMap())
         }
         assertThat(error.stdout).contains("10106102")
+        assertThat(device.commands).hasSize(1)
+    }
+
+    @Test
+    fun `launch waits for stable focus and retries activation without force stop`() {
+        val device = Device()
+        device.focused = { device.commands.size == 2 }
+        val driver = HarmonyOSDriver(device, HarmonyOSDriverConfig(
+            abilityName = "TestAbility", commandTimeout = Duration.ofMillis(200), pollInterval = Duration.ofMillis(1),
+        ))
+        driver.open()
+        driver.launchApp("org.example.demo", emptyMap())
+        val start = listOf("aa", "start", "-b", "org.example.demo", "-a", "TestAbility")
+        assertThat(device.commands).containsExactly(start, start).inOrder()
+        assertThat(device.focusSamples).isAtLeast(3)
+    }
+
+    @Test
+    fun `failed foreground confirmation does not replay arguments`() {
+        val device = Device()
+        device.focused = { false }
+        val driver = HarmonyOSDriver(device, HarmonyOSDriverConfig(
+            abilityName = "TestAbility", commandTimeout = Duration.ofMillis(30), pollInterval = Duration.ofMillis(1),
+        ))
+        driver.open()
+        val failure = assertThrows(HarmonyOSCommandException::class.java) {
+            driver.launchApp("org.example.demo", mapOf("token" to "value"))
+        }
+        assertThat(failure).hasMessageThat().contains("did not acquire window focus")
         assertThat(device.commands).hasSize(1)
     }
 
@@ -173,12 +232,59 @@ class HarmonyOSDriverTest {
         driver.open()
         driver.setPermissions("org.example.demo", emptyMap())
         assertThrows(UnsupportedOperationException::class.java) { driver.setPermissions("org.example.demo", mapOf("all" to "allow")) }
-        assertThrows(UnsupportedOperationException::class.java) { driver.hideKeyboard() }
+        driver.hideKeyboard()
         assertThrows(UnsupportedOperationException::class.java) { driver.startScreenRecording(Buffer()) }
-        assertThrows(UnsupportedOperationException::class.java) { driver.clearAppState("org.example.demo") }
         assertThrows(UnsupportedOperationException::class.java) { driver.contentDescriptor(true) }
         assertThat(driver.capabilities()).isEmpty()
         assertThat(device.commands).isEmpty()
+    }
+
+    @Test
+    fun `clear state issues a bundle scoped command and requires positive confirmation`() {
+        val device = Device()
+        val driver = driver(device)
+        driver.open()
+        assertThrows(IllegalArgumentException::class.java) { driver.clearAppState("-n") }
+        assertThat(device.commands).isEmpty()
+
+        val dumpCommand = listOf("bm", "dump", "-n", "org.example.demo")
+        val stopCommand = listOf("aa", "force-stop", "org.example.demo")
+        val clearCommand = listOf("bm", "clean", "-d", "-n", "org.example.demo")
+        device.bundleMetadata = """{"name":"org.example.demo","applicationInfo":{"bundleType":1,"userDataClearable":true}}"""
+        assertThrows(UnsupportedOperationException::class.java) { driver.clearAppState("org.example.demo") }
+        device.bundleMetadata = """{"name":"org.example.demo","applicationInfo":{"bundleType":0,"userDataClearable":false}}"""
+        assertThrows(UnsupportedOperationException::class.java) { driver.clearAppState("org.example.demo") }
+        device.bundleMetadata = """{"name":"another.application","applicationInfo":{"bundleType":0,"userDataClearable":true}}"""
+        assertThrows(IllegalStateException::class.java) { driver.clearAppState("org.example.demo") }
+        assertThat(device.commands).containsExactly(dumpCommand, dumpCommand, dumpCommand)
+        device.commands.clear()
+
+        device.bundleMetadata = """{"name":"org.example.demo","applicationInfo":{"bundleType":0,"userDataClearable":true}}"""
+        device.clearOutput = "permission denied"
+        val error = assertThrows(HarmonyOSCommandException::class.java) { driver.clearAppState("org.example.demo") }
+        assertThat(error.stdout).contains("permission denied")
+        assertThat(device.commands).containsExactly(dumpCommand, stopCommand, clearCommand).inOrder()
+
+        device.clearOutput = "clean bundle data files successfully."
+        driver.clearAppState("org.example.demo")
+        assertThat(device.commands).containsExactly(dumpCommand, stopCommand, clearCommand, dumpCommand, stopCommand, clearCommand).inOrder()
+    }
+
+    @Test
+    fun `open link dispatches one URI argument and validates unsupported requests before device work`() {
+        val device = Device().apply { output = "start ability successfully." }
+        val driver = driver(device)
+        driver.open()
+        assertThrows(IllegalArgumentException::class.java) { driver.openLink("relative/path", null, false, false) }
+        assertThrows(IllegalArgumentException::class.java) { driver.openLink("example://link", null, false, true) }
+        assertThrows(UnsupportedOperationException::class.java) { driver.openLink("https://example.com", null, true, false) }
+        assertThat(device.commands).isEmpty()
+        driver.openLink("example://link?x=1&y=2", "org.example.flow", false, false)
+        driver.openLink("https://example.com/path", null, false, true)
+        assertThat(device.commands).containsExactly(
+            listOf("aa", "start", "-U", "example://link?x=1&y=2"),
+            listOf("aa", "start", "-A", "ohos.want.action.viewData", "-U", "https://example.com/path"),
+        ).inOrder()
     }
 
     @Test
@@ -305,6 +411,55 @@ class HarmonyOSDriverTest {
         assertThat(assertThrows(HdcException::class.java) { driver.close() }).isSameInstanceAs(error)
         assertThat(backendRecording.closeCalls).isEqualTo(1)
         assertThat(driver.isShutdown()).isTrue()
+    }
+
+    @Test
+    fun `geometry queries follow rotation without capturing frames`() {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+        device.size = 120 to 80
+        assertThat(driver.deviceInfo().widthGrid).isEqualTo(120)
+        assertThat(driver.deviceInfo().heightGrid).isEqualTo(80)
+        driver.tap(Point(119, 79))
+        assertThat(device.screenshots).isEqualTo(1)
+        assertThat(device.commands.last()).containsExactly("uitest", "uiInput", "click", "119", "79").inOrder()
+        driver.takeScreenshot(Buffer(), false)
+        assertThat(device.screenshots).isEqualTo(2)
+    }
+
+    @Test
+    fun `preview can sample when the flow is idle and stops on close`() {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+        val preview = java.util.concurrent.CompletableFuture<ByteArray>()
+        try {
+            driver.startFramePreview({ !preview.isDone }) { preview.complete(it) }
+            assertThat(preview.get(3, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(device.image)
+        } finally {
+            driver.close()
+        }
+        assertThat(device.screenshots).isEqualTo(2)
+    }
+
+    @Test
+    fun `matching pre-tap lookup saves a sample but input invalidates it`() {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+
+        fun lookup() = ViewHierarchy.from(driver, false)
+        val initial = lookup()
+        val beforeSettle = device.layoutReads
+        assertThat(driver.waitForAppToSettle(initial, null, 1000)).isNotNull()
+        assertThat(device.layoutReads - beforeSettle).isEqualTo(1)
+
+        val beforeTap = lookup()
+        driver.tap(Point(20, 20))
+        val afterTap = device.layoutReads
+        assertThat(driver.waitForAppToSettle(beforeTap, null, 1000)).isNotNull()
+        assertThat(device.layoutReads - afterTap).isEqualTo(2)
     }
 
     @Test
@@ -482,6 +637,33 @@ class HarmonyOSDriverTest {
         }
     }
 
+    @Test
+    fun `keyboard dismissal sends Back once and confirms app focus`() {
+        val device = Device()
+        val driver = driver(device)
+        driver.open()
+        driver.launchApp("org.example.demo", emptyMap())
+        var reads = 0
+        device.keyboard = { reads++ == 0 }
+        driver.hideKeyboard()
+        assertThat(device.commands.count { it == listOf("uitest", "uiInput", "keyEvent", "Back") }).isEqualTo(1)
+        assertThat(device.focusSamples).isAtLeast(3)
+        driver.hideKeyboard()
+        assertThat(device.commands.count { it == listOf("uitest", "uiInput", "keyEvent", "Back") }).isEqualTo(1)
+    }
+
+    @Test
+    fun `keyboard disappearance must not hide loss of target focus`() {
+        val device = Device()
+        val driver = driver(device)
+        driver.open()
+        driver.launchApp("org.example.demo", emptyMap())
+        device.focused = { false }
+        var calls = 0
+        device.keyboard = { calls++ == 0 }
+        assertThrows(HarmonyOSCommandException::class.java) { driver.hideKeyboard() }
+    }
+
     private fun driver(device: Device) = HarmonyOSDriver(
         device,
         HarmonyOSDriverConfig(abilityName = "TestAbility", moduleName = "entry", pollInterval = Duration.ofMillis(1)),
@@ -492,8 +674,11 @@ class HarmonyOSDriverTest {
         var layoutReads = 0
         var screenshots = 0
         var image = png(80, 120)
+        var size: Pair<Int, Int>? = null
         var layout: () -> TreeNode = { tree("ready") }
         var output: String? = null
+        var bundleMetadata = ""
+        var clearOutput = ""
         var executeFailure: Throwable? = null
         var screenshotFailure: Throwable? = null
         var recordingFactory: ((Sink, HarmonyOSDriverConfig) -> ScreenRecording)? = null
@@ -504,8 +689,17 @@ class HarmonyOSDriverTest {
         val layoutBudgets = mutableListOf<Duration>()
         val screenshotBudgets = mutableListOf<Duration>()
         var beforeScreenshot: () -> Unit = {}
+        var focused: () -> Boolean = { true }
+        var focusSamples = 0
+        var keyboard: () -> Boolean = { false }
+        override fun keyboardVisible(timeout: Duration): Boolean = keyboard()
+        override fun hasAppFocus(appId: String, timeout: Duration): Boolean {
+            focusSamples++
+            return focused()
+        }
         override fun connect() { connections++ }
         override fun isAvailable(): Boolean = true
+        override fun displaySize(timeout: Duration): Pair<Int, Int>? = size
         override fun hierarchy(timeout: Duration): TreeNode { layoutReads++; layoutBudgets += timeout; return layout() }
         override fun screenshot(timeout: Duration): ByteArray {
             screenshots++
@@ -518,6 +712,8 @@ class HarmonyOSDriverTest {
             commands += arguments
             executeFailure?.let { throw it }
             return output ?: when (arguments.take(2)) {
+                listOf("bm", "dump") -> bundleMetadata
+                listOf("bm", "clean") -> clearOutput
                 listOf("aa", "start") -> "start ability successfully."
                 listOf("aa", "force-stop") -> "force stop process successfully."
                 else -> ""

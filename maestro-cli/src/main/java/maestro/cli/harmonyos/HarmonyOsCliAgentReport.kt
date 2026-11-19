@@ -264,7 +264,7 @@ class HarmonyOsCliAgentReport private constructor(private val attempt: AgentAtte
                         val path = confinedArtifact(artifact.path)
                         if (Files.isRegularFile(path)) {
                             val capturedAt = Files.getLastModifiedTime(path).toInstant()
-                            val phase = when {
+                            val phase = artifact.phase ?: when {
                                 id in failedSteps && step.timestamp?.let { capturedAt.toEpochMilli() >= it + (step.duration ?: 0) } == true -> "failure"
                                 artifact.type == ArtifactKind.SCREENSHOT -> "before"
                                 else -> "after"
@@ -281,6 +281,7 @@ class HarmonyOsCliAgentReport private constructor(private val attempt: AgentAtte
                 val path = confinedArtifact(artifact.relativePath)
                 if (Files.isRegularFile(path)) {
                     attempt.recordFile(null, kind, path, "after")
+                    if (path.fileName.toString() == HarmonyOsRetryTrace.FAULT_REPORT_NAME) return@forEach
                     failedSteps.forEach { id ->
                         attempt.recordFile(id, kind, path, "failure")
                         captured.getOrPut(id) { mutableSetOf() } += kind
@@ -323,7 +324,12 @@ class HarmonyOsCliAgentReport private constructor(private val attempt: AgentAtte
                             val path = confinedArtifact(artifact.path("path").asText())
                             if (Files.isRegularFile(path)) {
                                 val time = Files.getLastModifiedTime(path).toInstant()
-                                val phase = if (id in failedSteps && metadata.hasNonNull("timestamp") && time.toEpochMilli() >= metadata.path("timestamp").asLong() + metadata.path("duration").asLong()) "failure" else if (type == ArtifactKind.SCREENSHOT) "before" else "after"
+                                val phase = artifact.path("phase").textValue() ?: when {
+                                    id in failedSteps && metadata.hasNonNull("timestamp") &&
+                                        time.toEpochMilli() >= metadata.path("timestamp").asLong() + metadata.path("duration").asLong() -> "failure"
+                                    type == ArtifactKind.SCREENSHOT -> "before"
+                                    else -> "after"
+                                }
                                 attempt.recordFile(id, kind, path, phase, time)
                                 captured.getOrPut(id) { mutableSetOf() } += kind
                             }
@@ -337,9 +343,13 @@ class HarmonyOsCliAgentReport private constructor(private val attempt: AgentAtte
                         val kind = kind(type) ?: return@artifactLoop
                         if (kind !in setOf("log", "commands", "video") || artifact.hasNonNull("count")) return@artifactLoop
                         val path = confinedArtifact(artifact.path("relativePath").asText())
-                        if (Files.isRegularFile(path)) failedSteps.forEach { id ->
-                            attempt.recordFile(id, kind, path, "failure", Files.getLastModifiedTime(path).toInstant())
-                            captured.getOrPut(id) { mutableSetOf() } += kind
+                        if (Files.isRegularFile(path)) {
+                            attempt.recordFile(null, kind, path, "after")
+                            if (path.fileName.toString() == HarmonyOsRetryTrace.FAULT_REPORT_NAME) return@artifactLoop
+                            failedSteps.forEach { id ->
+                                attempt.recordFile(id, kind, path, "failure", Files.getLastModifiedTime(path).toInstant())
+                                captured.getOrPut(id) { mutableSetOf() } += kind
+                            }
                         }
                     }
                     attempt.recordManifest(manifest)

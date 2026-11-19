@@ -2,10 +2,14 @@ package maestro.cli.harmonyos
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.google.common.truth.Truth.assertThat
+import maestro.harmonyos.driver.HarmonyOSFaultClock
+import maestro.harmonyos.driver.HarmonyOSFlowFault
+import maestro.harmonyos.driver.HarmonyOSFlowFaults
 import maestro.orchestra.debug.ExecutionContext
 import maestro.orchestra.debug.ExecutionEvent
 import maestro.orchestra.debug.ExecutionTraceArtifacts
 import maestro.orchestra.debug.ExecutionTraceEnd
+import maestro.orchestra.debug.HarmonyOSFaultInspection
 import maestro.orchestra.debug.RetryExecutionEvent
 import maestro.orchestra.debug.RetryExecutionFrame
 import org.junit.jupiter.api.Test
@@ -39,7 +43,7 @@ class HarmonyOsRetryTraceTest {
                 if (failRefresh) throw IOException("injected manifest failure")
             }))
         }
-        fun event() = ExecutionEvent(sequence++, sequence * 100)
+        fun event() = ExecutionEvent(sequence++, sequence * 100_000_000)
         fun context(index: Int, retry: List<RetryExecutionFrame> = emptyList()) =
             ExecutionContext(index, if (retry.isEmpty()) null else 0, retry, null, "body", emptyList())
         fun start(index: Int, retry: List<RetryExecutionFrame> = emptyList()) = context(index, retry).also {
@@ -51,13 +55,43 @@ class HarmonyOsRetryTraceTest {
             trace.stepFinished("step-" + context.executionSequence, context, outcome, null, event())
         fun retry(kind: String, tryNo: Int? = null, outcome: String? = null, optional: Boolean = false) =
             trace.retry(RetryExecutionEvent(event(), kind, "retry-1", 0, emptyList(), 1, optional, tryNo, outcome))
-        fun seal(lastStep: Int, success: Boolean? = true) {
+        fun seal(lastStep: Int, success: Boolean? = true, faults: HarmonyOSFaultInspection? = null) {
             val ending = event()
-            trace.ended(ExecutionTraceEnd(ending, sequence, sequence + 1, lastStep, 0, 0, success, null))
+            trace.ended(ExecutionTraceEnd(ending, sequence, sequence + 1, lastStep, 0, 0, success, null, faults))
             trace.seal(success)
         }
         fun summary() = mapper.readTree(directory.resolve("retry-summary.json").toFile())
         fun events() = Files.readAllLines(directory.resolve("retry-trace.jsonl")).map { mapper.readTree(it) }
+    }
+
+    @Test
+    fun `associates an occurrence to its own retry and leaves uncertain events at flow scope`() {
+        val fixture = Fixture()
+        val owner = fixture.start(0)
+        fixture.retry("retryBlockStarted")
+        fixture.retry("retryTryStarted", 1)
+        val first = fixture.start(1, listOf(RetryExecutionFrame("retry-1", 0, 1)))
+        fixture.finish(first, "Failed")
+        fixture.retry("retryTryFinished", 1, "failed")
+        fixture.retry("retryScheduled", 2)
+        fixture.retry("retryTryStarted", 2)
+        val second = fixture.start(2, listOf(RetryExecutionFrame("retry-1", 0, 2)))
+        fixture.finish(second)
+        fixture.retry("retryTryFinished", 2, "completed")
+        fixture.retry("retryBlockFinished", outcome = "completed")
+        fixture.finish(owner)
+        val event = HarmonyOSFlowFault("JS_ERROR", 1430, "unhandled error", mapOf("STACK" to "line 23"), true)
+        val delayed = HarmonyOSFlowFault("APP_FREEZE", 1930, "reported after detection")
+        val between = event.copy(timeMs = 1600, reason = "between retries")
+        fixture.seal(2, faults = HarmonyOSFaultInspection("demo.target", "complete",
+            HarmonyOSFlowFaults(event, delayed, listOf(event, between, delayed), HarmonyOSFaultClock(10, 20)), 1000))
+        val report = mapper.readTree(directory.resolve(HarmonyOsRetryTrace.FAULT_REPORT_NAME).toFile())
+        assertThat(report["events"][0]["stepId"].asText()).isEqualTo("step-1")
+        assertThat(report["events"][0]["retryContext"][0]["tryNo"].asInt()).isEqualTo(1)
+        assertThat(report["events"][0]["details"]["STACK"].asText()).isEqualTo("line 23")
+        assertThat(report["events"][1]["stepId"].isNull).isTrue()
+        assertThat(report["events"][2]["stepId"].isNull).isTrue()
+        assertThat(fixture.summary()["state"].asText()).isEqualTo("complete")
     }
 
     @Test
