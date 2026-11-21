@@ -244,14 +244,35 @@ internal class AgentAttempt internal constructor(
     }
 
     @Synchronized fun recordFile(stepId: String?, kind: String, path: Path, phase: String, capturedAt: Instant = Instant.now()) {
-        val relative = relative(path)
+        var relative = relative(path)
         if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
             recordUnavailable(stepId, kind, "missing", phase)
             return
         }
-        val hash = try { sha256(path.toFile().readBytes()) } catch (error: java.io.IOException) {
+        val bytes = try { path.toFile().readBytes() } catch (error: java.io.IOException) {
             recordUnavailable(stepId, kind, "capture_failed", phase, HarmonyOsAgentProtocol.error(error))
             return
+        }
+        val hash = sha256(bytes)
+        if (hasFileReference(stepId, relative, kind, phase, hash)) return
+        val alreadyReferenced = entries.any { entry ->
+            (entry["evidence"] as List<*>).filterIsInstance<Map<*, *>>().any { it["path"] == relative }
+        }
+        if (alreadyReferenced) {
+            // A v1 path has one owner. Keep other step/phase associations as immutable,
+            // content-identical files instead of registering that path a second time.
+            val identity = sha256(listOf(stepId, relative, kind, phase, hash).joinToString("\u0000").toByteArray())
+            val extension = path.fileName.toString().substringAfterLast('.', "").takeIf { it.matches(Regex("[A-Za-z0-9]{1,12}")) }
+            val reference = directory.resolve("evidence-ref-$identity" + (extension?.let { ".$it" } ?: ""))
+            if (Files.exists(reference, LinkOption.NOFOLLOW_LINKS)) {
+                require(Files.isRegularFile(reference, LinkOption.NOFOLLOW_LINKS))
+                relative(reference)
+                require(sha256(Files.readAllBytes(reference)) == hash) { "Evidence reference bytes changed." }
+            } else {
+                Files.write(reference, bytes, StandardOpenOption.CREATE_NEW)
+            }
+            relative = relative(reference)
+            if (hasFileReference(stepId, relative, kind, phase, hash)) return
         }
         appendEvidence(stepId, mapOf("kind" to kind, "state" to "available", "path" to relative,
             "sha256" to hash, "capturedAt" to capturedAt.toString(), "phase" to phase, "error" to null))
@@ -375,6 +396,13 @@ internal class AgentAttempt internal constructor(
     }
 
     @Suppress("UNCHECKED_CAST") private fun artifacts() = data["artifacts"] as MutableMap<String, Any?>
+
+    private fun hasFileReference(stepId: String?, path: String, kind: String, phase: String, hash: String): Boolean {
+        val entry = entries.firstOrNull { it["stepId"] == stepId } ?: return false
+        return (entry["evidence"] as List<*>).filterIsInstance<Map<*, *>>().any {
+            it["path"] == path && it["kind"] == kind && it["phase"] == phase && it["sha256"] == hash
+        }
+    }
 
     private fun appendEvidence(stepId: String?, evidence: Map<String, Any?>) {
         val entry = entries.firstOrNull { it["stepId"] == stepId } ?: linkedMapOf<String, Any?>(

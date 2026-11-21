@@ -384,7 +384,8 @@ class HarmonyOSRecoveryJournal private constructor(
         }
         try {
             for (operation in state.operations.filterNot { it.completed }) {
-                if (!operation.recoverable) {
+                // Legacy diagnostic recovery is explicitly scoped and still requires the exact device completion proof.
+                if (!operation.recoverable && !HarmonyOSDiagnosticCompletionRecovery.accepts(state.deviceId, state.ownerId, operation.id, operation.sha256, state.hostCalls.filter { it.stopped }.map { it.id })) {
                     problems += RecoveryIssue("UNSUPPORTED_RECOVERY_SCOPE", "The interrupted command has no declared finite recovery scope.")
                     continue
                 }

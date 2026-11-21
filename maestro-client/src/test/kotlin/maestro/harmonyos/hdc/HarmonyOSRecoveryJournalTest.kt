@@ -475,6 +475,76 @@ class HarmonyOSRecoveryJournalTest {
         }
     }
 
+    @Test fun `reviewed legacy fault query requires exact proof and never redispatches`() {
+        create().use { journal ->
+            val remote = FakeRemote(file()).apply { loseResponse = true; proofAvailable = false }
+            val hdc = HdcClient("fake", remote).withRecoveryJournal(journal)
+            hdc.allocateTemporaryFile("layout", "json")
+            assertThrows(InterruptedException::class.java) { hdc.shell("fixture-target", listOf("sh", "-c", "hisysevent -l")) }
+            journal.seal()
+            assertThat(journal.recover(hdc).issues.map { it.code }).contains("UNSUPPORTED_RECOVERY_SCOPE")
+            val state = mapper.readTree(file().toFile()); val op = state["operations"].first()
+            val trace = directory.resolve("reviewed.log")
+            val line = mapOf("schemaVersion" to 1, "operationId" to op["id"].asText(), "callId" to UUID.randomUUID().toString(),
+                "hostCallId" to state["hostCalls"].last()["id"].asText(), "category" to "FAULT_QUERY")
+            Files.writeString(trace, "MAESTRO_HDC_CALL " + mapper.writeValueAsString(line + ("hostCallId" to null)) + "\nMAESTRO_HDC_CALL " + mapper.writeValueAsString(line))
+            val hash = java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(trace)).joinToString("") { "%02x".format(it) }
+            fun recover(commandHash: String = op["sha256"].asText()): RecoveryReport =
+                HarmonyOSDiagnosticCompletionRecovery.withReviewedFaultQuery("fixture-target", journal.ownerId, op["id"].asText(), commandHash,
+                    trace, hash, java.util.function.Supplier { journal.recover(hdc) })
+            assertThat(recover().state).isEqualTo("unknown")
+            assertThat(remote.cleanup).isEmpty()
+            remote.proofAvailable = true; remote.foreignProof = true
+            assertThat(recover().state).isEqualTo("unknown")
+            assertThat(remote.cleanup).isEmpty()
+            remote.foreignProof = false
+            assertThat(recover("0".repeat(64)).state).isEqualTo("unknown")
+            assertThat(remote.cleanup).isEmpty()
+            assertThat(recover().state).isEqualTo("complete")
+            assertThat(remote.dispatched).isEqualTo(1)
+            val final = mapper.readTree(file().toFile())["operations"].first()
+            assertThat(final["recoverable"].asBoolean()).isFalse()
+            assertThat(final["completed"].asBoolean()).isTrue()
+            assertThat(remote.cleanup).hasSize(1)
+        }
+    }
+
+    @Test fun `reviewed fault scope rejects changed traces shell categories and mismatched owners`() {
+        val owner = UUID.randomUUID().toString(); val operation = UUID.randomUUID().toString()
+        val trace = directory.resolve("trace.log")
+        val event = mutableMapOf<String, Any>("schemaVersion" to 1, "operationId" to operation, "callId" to UUID.randomUUID().toString(),
+            "hostCallId" to UUID.randomUUID().toString(), "category" to "SHELL_SCRIPT")
+        fun write() { Files.writeString(trace, "MAESTRO_HDC_CALL " + mapper.writeValueAsString(event)) }
+        fun hash() = java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(trace)).joinToString("") { "%02x".format(it) }
+        write()
+        assertThrows(IllegalArgumentException::class.java) {
+            HarmonyOSDiagnosticCompletionRecovery.withReviewedFaultQuery("fixture-target", owner, operation, "1".repeat(64), trace, hash(),
+                java.util.function.Supplier { error("No cleanup allowed") })
+        }
+        event["category"] = "FAULT_QUERY"; write(); val expected = hash(); Files.writeString(trace, "changed")
+        assertThrows(IllegalArgumentException::class.java) {
+            HarmonyOSDiagnosticCompletionRecovery.withReviewedFaultQuery("fixture-target", owner, operation, "1".repeat(64), trace, expected,
+                java.util.function.Supplier { error("No cleanup allowed") })
+        }
+        write()
+        assertThrows(IllegalStateException::class.java) {
+            HarmonyOSDiagnosticCompletionRecovery.withReviewedFaultQuery("fixture-target", owner, operation, "1".repeat(64), trace, hash(),
+                java.util.function.Supplier {
+                    val hosts = listOf(event["hostCallId"] as String)
+                    assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", owner, operation, "1".repeat(64), hosts)).isTrue()
+                    assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("other-target", owner, operation, "1".repeat(64), hosts)).isFalse()
+                    assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", UUID.randomUUID().toString(), operation, "1".repeat(64), hosts)).isFalse()
+                    assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", owner, UUID.randomUUID().toString(), "1".repeat(64), hosts)).isFalse()
+                    assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", owner, operation, "1".repeat(64), listOf(UUID.randomUUID().toString()))).isFalse()
+                    assertThat(java.util.concurrent.CompletableFuture.supplyAsync {
+                        HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", owner, operation, "1".repeat(64), hosts)
+                    }.get()).isFalse()
+                    error("Scope must be cleared after exceptions")
+                })
+        }
+        assertThat(HarmonyOSDiagnosticCompletionRecovery.accepts("fixture-target", owner, operation, "1".repeat(64), listOf(event["hostCallId"] as String))).isFalse()
+    }
+
     private class FakeRemote(private val journal: Path) : HdcCommandRunner {
         var dispatched = 0
         var loseResponse = false

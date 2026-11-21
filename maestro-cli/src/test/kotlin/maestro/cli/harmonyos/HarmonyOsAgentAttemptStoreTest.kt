@@ -206,6 +206,46 @@ class HarmonyOsAgentAttemptStoreTest {
         assertThat(json(attempt.result())["data"]["status"].asText()).isEqualTo("passed")
     }
 
+    @Test fun `shared failure logs have unique immutable paths and retain every owner`() {
+        val attempt = register()
+        val first = attempt.startStep("flow.yaml", 0, "First", false)
+        val second = attempt.startStep("flow.yaml", 1, "Second", false)
+        val log = attempt.directory.resolve("maestro.log")
+        Files.writeString(log, "original failure diagnostics")
+        attempt.recordFile(null, "log", log, "after")
+        for (step in listOf(first, second)) {
+            attempt.recordFile(step, "log", log, "failure")
+            attempt.recordFile(step, "log", log, "failure")
+        }
+        val entries = json(attempt.evidence())["data"]["entries"].toList()
+        val evidence = entries.flatMap { it["evidence"].toList() }
+        assertThat(evidence).hasSize(3)
+        assertThat(evidence.map { it["path"].asText() }.toSet()).hasSize(3)
+        assertThat(entries.mapNotNull { it["stepId"].takeUnless { id -> id.isNull }?.asText() })
+            .containsExactly(first, second)
+        for (item in evidence) {
+            assertThat(Files.readString(attempt.directory.resolve(item["path"].asText())))
+                .isEqualTo("original failure diagnostics")
+            assertThat(item["sha256"].asText()).isEqualTo(evidence[0]["sha256"].asText())
+        }
+        assertThat(Files.readString(log)).isEqualTo("original failure diagnostics")
+    }
+
+    @Test fun `a tampered shared reference is refused without overwriting bytes`() {
+        val attempt = register()
+        val step = attempt.startStep("flow.yaml", 0, "First", false)
+        val log = attempt.directory.resolve("maestro.log")
+        Files.writeString(log, "original")
+        attempt.recordFile(null, "log", log, "after")
+        attempt.recordFile(step, "log", log, "failure")
+        val entry = json(attempt.evidence())["data"]["entries"].single { it["stepId"].asText() == step }
+        val alias = attempt.directory.resolve(entry["evidence"][0]["path"].asText())
+        Files.writeString(alias, "tampered")
+        assertThrows<IllegalArgumentException> { attempt.recordFile(step, "log", log, "failure") }
+        assertThat(Files.readString(alias)).isEqualTo("tampered")
+        assertThat(Files.readString(log)).isEqualTo("original")
+    }
+
     @Test fun `successful retry clears failure summary while preserving each step occurrence`() {
         val attempt = register()
         val one = attempt.startStep("flow.yaml", 3, "AssertConditionCommand", false)
