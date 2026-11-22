@@ -22,6 +22,7 @@ data class HarmonyOSDriverConfig(
     val arkWebTarget: HarmonyOSArkWebTarget? = null,
     val automaticLayoutRpc: Boolean = false,
     val hostRecordingFfmpeg: Path? = null,
+    val hostRecordingDeduplicateFrames: Boolean = false,
 ) {
     init {
         require((layoutRpcPort == null) == (layoutRpcDevice == null)) { "Set both layout RPC port and target device" }

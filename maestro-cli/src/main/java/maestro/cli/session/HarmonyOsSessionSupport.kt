@@ -105,6 +105,11 @@ internal object HarmonyOsSessionSupport {
                 ffmpeg?.takeIf { it.isAbsolute && Files.isRegularFile(it) && Files.isExecutable(it) }
                     ?: throw CliError("Set MAESTRO_HARMONYOS_FFMPEG to an absolute FFmpeg executable for host-frames.")
             } else null,
+            hostRecordingDeduplicateFrames = when (environment["MAESTRO_HARMONYOS_HOST_RECORDING_DEDUPLICATE_FRAMES"]?.trim()) {
+                null, "", "false" -> false
+                "true" -> true
+                else -> throw CliError("MAESTRO_HARMONYOS_HOST_RECORDING_DEDUPLICATE_FRAMES must be true or false.")
+            },
             recordingRetainMedia = when (val retain = environment["MAESTRO_HARMONYOS_RECORDING_RETAIN_MEDIA"]?.trim()) {
                 null, "", "false" -> false
                 "true" -> true

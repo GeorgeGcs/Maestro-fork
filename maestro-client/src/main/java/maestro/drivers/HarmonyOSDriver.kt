@@ -425,7 +425,10 @@ class HarmonyOSDriver(
         recordingFailure?.let { throw it }
         check(recording == null) { "This driver already owns a recording" }
         val host = config.hostRecordingFfmpeg?.let {
-            HarmonyOSHostFrameRecording(out, it, config.recordingMaxDuration, config.recordingMaxBytes, config.recordingStopTimeout)
+            HarmonyOSHostFrameRecording(
+                out, it, config.recordingMaxDuration, config.recordingMaxBytes, config.recordingStopTimeout,
+                deduplicateFrames = config.hostRecordingDeduplicateFrames,
+            )
         }
         try {
             val current = host ?: transport.withLock { device.startScreenRecording(out, config) }

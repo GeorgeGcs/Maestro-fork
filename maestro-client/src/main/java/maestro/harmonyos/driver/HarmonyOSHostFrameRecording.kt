@@ -25,6 +25,7 @@ internal class HarmonyOSHostFrameRecording(
     private val maxDuration: Duration,
     private val maxBytes: Long,
     private val stopTimeout: Duration,
+    private val deduplicateFrames: Boolean,
 ) : ScreenRecording {
     override val startedAt = Instant.now()
     private val startNanos = System.nanoTime()
@@ -34,6 +35,7 @@ internal class HarmonyOSHostFrameRecording(
     private val dropped = AtomicInteger()
     private val frames = mutableListOf<Pair<String, Long>>()
     private var savedBytes = 0L
+    private var duplicates = 0
     @Volatile private var accepting = true
     @Volatile private var failure: IOException? = null
     private val writer = Thread({ stageFrames() }, "maestro-harmonyos-host-video").apply {
@@ -51,9 +53,14 @@ internal class HarmonyOSHostFrameRecording(
     }
 
     private fun stageFrames() {
+        var previousBytes: ByteArray? = null
         try {
             while (accepting || pending.isNotEmpty()) {
                 val frame = pending.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                if (deduplicateFrames && previousBytes?.contentEquals(frame.bytes) == true) {
+                    duplicates++
+                    continue
+                }
                 if (savedBytes + frame.bytes.size > maxBytes) {
                     throw IOException("Host recording reached the frame storage limit.")
                 }
@@ -61,6 +68,7 @@ internal class HarmonyOSHostFrameRecording(
                 Files.write(directory.resolve(name), frame.bytes)
                 savedBytes += frame.bytes.size
                 frames += name to frame.capturedAt
+                if (deduplicateFrames) previousBytes = frame.bytes
             }
         } catch (error: IOException) {
             failure = error
@@ -84,6 +92,7 @@ internal class HarmonyOSHostFrameRecording(
             val manifest = directory.resolve("frames.ffconcat")
             Files.writeString(manifest, buildString {
                 appendLine("ffconcat version 1.0")
+                // Skipped duplicates extend the previous image to the next saved frame or recording stop.
                 frames.forEachIndexed { index, (name, capturedAt) ->
                     val end = frames.getOrNull(index + 1)?.second ?: finishedAt
                     val duration = (end - capturedAt).coerceAtLeast(40_000_000) / 1e9
@@ -100,8 +109,8 @@ internal class HarmonyOSHostFrameRecording(
                 sink.writeAll(source)
                 sink.flush()
             }
-            logger.info("HarmonyOS host recording: frames={} dropped={} durationMs={}",
-                frames.size, dropped.get(), Duration.ofNanos(finishedAt - startNanos).toMillis())
+            logger.info("HarmonyOS host recording: frames={} duplicates={} deduplicateFrames={} dropped={} durationMs={}",
+                frames.size, duplicates, deduplicateFrames, dropped.get(), Duration.ofNanos(finishedAt - startNanos).toMillis())
         } finally {
             if (writer.isAlive) writer.interrupt()
             if (!writer.isAlive) directory.toFile().deleteRecursively()
