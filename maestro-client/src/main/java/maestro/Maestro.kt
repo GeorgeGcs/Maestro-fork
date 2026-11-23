@@ -232,7 +232,8 @@ class Maestro(
 
         val afterScroll = if (driver is maestro.drivers.HarmonyOSDriver && recentScroll &&
             !retryIfNoChange && !waitUntilVisible && !longPress && tapRepeat == null && waitToSettleTimeoutMs == null &&
-            driver.hasRecentHierarchy(initialHierarchy)
+            hasHarmonyScrollIdentity(element.treeNode) && element.treeNode.enabled == true &&
+            initialHierarchy.isVisible(element.treeNode) && driver.hasRecentHierarchy(initialHierarchy)
         ) {
             delay(ELEMENT_STABILITY_POLL_INTERVAL_MS)
             val freshHierarchy = viewHierarchy()
@@ -816,13 +817,15 @@ class Maestro(
         // Mirrors IOSDriver.SCREEN_SETTLE_TIMEOUT_MS (3000ms): the element-stability wait
         // stands in for the settle confirmation the iOS driver could not give, so keep the
         // two budgets aligned when tuning either.
+        private fun hasHarmonyScrollIdentity(node: TreeNode) =
+            !node.attributes["hostWindowId"].isNullOrBlank() && !node.attributes["accessibilityId"].isNullOrBlank()
+
         internal fun unchangedHarmonyScrollTarget(
             target: TreeNode,
             before: ViewHierarchy,
             after: ViewHierarchy,
         ): UiElement? {
-            if (target.attributes["hostWindowId"].isNullOrBlank() ||
-                target.attributes["accessibilityId"].isNullOrBlank()) return null
+            if (!hasHarmonyScrollIdentity(target)) return null
             val initial = before.refreshElement(target) ?: return null
             val latest = after.refreshElement(target) ?: return null
             if (initial.enabled != true || latest.enabled != true ||
