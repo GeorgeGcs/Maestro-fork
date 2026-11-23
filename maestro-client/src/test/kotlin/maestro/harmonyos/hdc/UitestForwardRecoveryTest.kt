@@ -18,7 +18,7 @@ class UitestForwardRecoveryTest {
     @Test fun `missing listener does not create or register a forward`() {
         val fixture = ForwardFixture(listening = false)
         newJournal().use { journal ->
-            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout)).isNull()
+            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout).reason).isEqualTo("listener_missing")
             journal.seal()
             assertThat(journal.recover(fixture.client).state).isEqualTo("complete")
         }
@@ -29,7 +29,7 @@ class UitestForwardRecoveryTest {
     @Test fun `a confirmed forward is persisted before use and recovered after reopen`() {
         val fixture = ForwardFixture()
         newJournal().use { journal ->
-            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout)).isEqualTo(fixture.port)
+            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout).port).isEqualTo(fixture.port)
             assertThat(fixture.intentAtCreation).contains("\"confirmed\":false")
             assertThat(Files.readString(path)).contains("\"confirmed\":true")
         }
@@ -44,7 +44,7 @@ class UitestForwardRecoveryTest {
     @Test fun `manual or replacement rule owned by another device is preserved`() {
         val fixture = ForwardFixture()
         newJournal().use { journal ->
-            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout)).isNotNull()
+            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout).port).isNotNull()
             fixture.row = fixture.row!!.replace(device, "another-device")
             journal.seal()
             assertThat(journal.recover(fixture.client).state).isEqualTo("complete")
@@ -71,7 +71,7 @@ class UitestForwardRecoveryTest {
     @Test fun `malformed rule listing never counts as confirmed release`() {
         val fixture = ForwardFixture()
         newJournal().use { journal ->
-            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout)).isNotNull()
+            assertThat(fixture.client.withRecoveryJournal(journal).openAutomaticUitestLayoutForward(device, timeout).port).isNotNull()
             fixture.malformedList = true
             journal.seal()
             assertThat(journal.recover(fixture.client).state).isEqualTo("unknown")
@@ -93,7 +93,8 @@ class UitestForwardRecoveryTest {
         val client = HdcClient("fixture", HdcCommandRunner { command, _ ->
             val output = when {
                 command.drop(1) == listOf("-t", device, "shell", "cat /proc/net/unix") ->
-                    if (listening) "0: 00000002 0 10000 1 1 1234 @uitest_socket" else ""
+                    "Num RefCount Protocol Flags Type St Inode Path" +
+                        if (listening) "\n0: 00000002 0 10000 1 1 1234 @uitest_socket" else ""
                 command.drop(1) == listOf("fport", "ls") -> if (malformedList) "unrecognized" else row ?: "[Empty]"
                 command.take(5) == listOf("fixture", "-t", device, "fport", "rm") -> {
                     check(command.drop(5) == listOf("tcp:$port", "localabstract:uitest_socket"))

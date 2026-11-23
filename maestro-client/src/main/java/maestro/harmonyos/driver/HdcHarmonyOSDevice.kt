@@ -42,6 +42,11 @@ class HdcHarmonyOSDevice(
     private val automaticLayoutRpc: Boolean = false,
 ) : HarmonyOSDevice {
     private var layoutChannel: LoopbackLayoutChannel? = null
+    private var layoutReason = "not_connected"
+
+    internal fun logLayoutBackend() {
+        logger.info("HarmonyOS layout backend={} reason={}", if (layoutChannel == null) "hdc" else "rpc", layoutReason)
+    }
     private var displayRpcUnsupported = false
     private var reportedArkWebSource: String? = null
     private val arkWeb = arkWebPort?.let { ArkWebLoopback(it, arkWebTarget) }
@@ -58,23 +63,21 @@ class HdcHarmonyOSDevice(
     override fun connect() {
         hdc.selectDevice(deviceId)
         val timeout = Duration.ofSeconds(2)
-        val port = when {
-            layoutPort != null -> layoutPort.takeIf { hasLayoutForward(it, timeout) }
+        val forward = when {
+            layoutPort != null -> if (hasLayoutForward(layoutPort, timeout)) {
+                HdcClient.LayoutForward(layoutPort, "explicit_forward")
+            } else HdcClient.LayoutForward(null, "explicit_forward_unavailable")
             automaticLayoutRpc -> try {
                 hdc.openAutomaticUitestLayoutForward(deviceId, timeout)
             } catch (error: HdcException) {
                 checkInterrupted()
-                logger.debug("Automatic UITest forward failed ({})", error.javaClass.simpleName)
-                null
+                HdcClient.LayoutForward(null, "automatic_forward_failed_${error.javaClass.simpleName}")
             }
-            else -> return
+            else -> HdcClient.LayoutForward(null, "automatic_rpc_disabled")
         }
-        val mode = if (layoutPort == null) "automatic" else "explicit"
-        if (port == null) logger.info("UITest RPC ({}) unavailable; using HDC layout for this session", mode)
-        else {
-            layoutChannel = LoopbackLayoutChannel(port)
-            logger.info("UITest RPC layout enabled for this session ({})", mode)
-        }
+        layoutReason = forward.reason
+        layoutChannel = forward.port?.let(::LoopbackLayoutChannel)
+        logLayoutBackend()
     }
 
     override fun isAvailable(): Boolean = deviceId in hdc.listDevices()
@@ -338,7 +341,8 @@ class HdcHarmonyOSDevice(
         channel.close()
         layoutChannel = null
         checkInterrupted()
-        logger.warn("UITest RPC layout failed ({}); using HDC layout for the rest of this session", error.javaClass.simpleName)
+        layoutReason = "rpc_read_failed_${error.javaClass.simpleName}"
+        logLayoutBackend()
     }
 
     override fun execute(arguments: List<String>, timeout: Duration): String = executeWithReceipt(arguments, timeout, false)

@@ -12,12 +12,14 @@ import java.nio.file.Path
 /** Read-only observations; an implementation must never launch, unlock or change application state. */
 internal interface AgentEnvironmentProbe {
     fun devices(): List<String>
+    fun layoutRpcListener(deviceId: String): Boolean? = null
     fun lockStatus(deviceId: String): HarmonyOsSessionSupport.DeviceLockStatus
     fun execute(deviceId: String, arguments: List<String>): String
 }
 
 internal class HdcAgentEnvironmentProbe(private val hdc: HdcClient = HdcClient()) : AgentEnvironmentProbe {
     override fun devices(): List<String> = hdc.listDevices()
+    override fun layoutRpcListener(deviceId: String) = hdc.probeUitestLayoutListener(deviceId, Duration.ofSeconds(2))
     override fun lockStatus(deviceId: String) = HarmonyOsSessionSupport.probeDeviceLock(deviceId)
     override fun execute(deviceId: String, arguments: List<String>): String =
         HdcHarmonyOSDevice(deviceId, hdc).execute(arguments, Duration.ofSeconds(5))
@@ -116,6 +118,19 @@ internal class HarmonyOsAgentCapabilities(
         if (uitest != null && uitest.matches(Regex("/[^\\r\\n]+/uitest"))) {
             check("uitest", "passed", "UITEST_DISCOVERED", "UITest is discoverable; this does not verify every command.")
         } else check("uitest", "unknown", "PRECONDITION_UNKNOWN", "UITest availability was not confirmed by a read-only query.")
+
+        if (requested.any { it in LAYOUT_COMMANDS }) {
+            val listening = if (mayProbe) try { probe.layoutRpcListener(deviceId) }
+                catch (error: Exception) { propagateInterrupt(error); null } else null
+            when (listening) {
+                true -> check("layoutRpcListener", "passed", "UITEST_RPC_LISTENER_PRESENT",
+                    "An existing UITest listener was observed. The session will verify the forward and RPC response.", required = false)
+                false -> check("layoutRpcListener", "failed", "UITEST_RPC_LISTENER_MISSING",
+                    "Start a compatible UITest service before using RPC. HDC file layout is available as the fallback.", required = false)
+                null -> check("layoutRpcListener", "unknown", "UITEST_RPC_LISTENER_UNKNOWN",
+                    "The UITest listener state was not confirmed by a read-only observation.", required = false)
+            }
+        }
 
         if ("setOrientation" in requested) check("rotationBackend", "unknown", "PRECONDITION_UNKNOWN",
             "Rotation requires an active UITest RPC endpoint and a rotatable foreground application.")
@@ -218,6 +233,8 @@ internal class HarmonyOsAgentCapabilities(
     }
 
     companion object {
+        private val LAYOUT_COMMANDS = setOf("tapOn", "longPressOn", "assertVisible", "assertNotVisible",
+            "scrollUntilVisible", "extendedWaitUntil", "setOrientation")
         val METHODS = listOf("agent.describe", "agent.preflight", "agent.connect", "agent.session", "agent.snapshot",
             "agent.action", "agent.cancel", "agent.release", "agent.result", "agent.evidence")
         private val commands = listOf(

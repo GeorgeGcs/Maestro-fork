@@ -81,10 +81,27 @@ class HdcClient(
         return result.stdout
     }
 
-    /** Uses a running UITest service; creating a transport never starts or replaces a device daemon. */
-    internal fun openAutomaticUitestLayoutForward(deviceId: String, timeout: Duration): Int? {
+    /** A read-only observation. A malformed or unreadable socket table is inconclusive. */
+    fun probeUitestLayoutListener(deviceId: String, timeout: Duration): Boolean? {
         validateDeviceId(deviceId)
-        val journal = recoveryJournal ?: return null
+        val sockets = execute(listOf("-t", deviceId, "shell", "cat /proc/net/unix"), timeout,
+            category = HdcCommandCategory.SERVICE_QUERY)
+        if (sockets.stderr.isNotBlank()) return null
+        val lines = sockets.stdout.lineSequence().filter { it.isNotBlank() }.toList()
+        if (lines.any { line ->
+                val columns = line.trim().split(Regex("\\s+"))
+                columns.size == 8 && columns[3].toIntOrNull(16)?.and(0x10000) == 0x10000 &&
+                    columns[4].toIntOrNull(16) == 1 && columns[7] == "@uitest_socket"
+            }) return true
+        return if (lines.firstOrNull()?.trim()?.matches(Regex("Num\\s+RefCount\\s+.*")) == true) false else null
+    }
+
+    internal data class LayoutForward(val port: Int?, val reason: String)
+
+    /** Uses a running UITest service; creating a transport never starts or replaces a device daemon. */
+    internal fun openAutomaticUitestLayoutForward(deviceId: String, timeout: Duration): LayoutForward {
+        validateDeviceId(deviceId)
+        val journal = recoveryJournal ?: return LayoutForward(null, "session_ownership_unavailable")
         check(journal.deviceId == deviceId) { "UITest forward does not match the session target." }
         val deadline = System.nanoTime() + timeout.toNanos()
         fun remaining(): Duration {
@@ -92,19 +109,17 @@ class HdcClient(
             if (nanos <= 0) throw HdcTimeoutException(timeout)
             return Duration.ofNanos(nanos)
         }
-        val sockets = execute(listOf("-t", deviceId, "shell", "cat /proc/net/unix"), remaining(),
-            category = HdcCommandCategory.SERVICE_QUERY)
-        if (sockets.stderr.isNotBlank() || sockets.stdout.lineSequence().none { line ->
-                val columns = line.trim().split(Regex("\\s+"))
-                columns.size == 8 && columns[3].toIntOrNull(16)?.and(0x10000) == 0x10000 &&
-                    columns[4].toIntOrNull(16) == 1 && columns[7] == "@uitest_socket"
-            }) return null
+        when (probeUitestLayoutListener(deviceId, remaining())) {
+            false -> return LayoutForward(null, "listener_missing")
+            null -> return LayoutForward(null, "listener_unknown")
+            true -> Unit
+        }
         val port = try {
             ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
         } catch (error: java.io.IOException) {
             throw HdcException("No loopback port could be allocated for UITest.", error)
         }
-        if (portRows(listForwards(remaining()), port).isNotEmpty()) return null
+        if (portRows(listForwards(remaining()), port).isNotEmpty()) return LayoutForward(null, "host_port_in_use")
         journal.registerLayoutForward(port)
         val created = execute(listOf("-t", deviceId, "fport", "tcp:$port", UITEST_ENDPOINT), remaining(), trackHost = true,
             category = HdcCommandCategory.LAYOUT_FORWARD_CREATE)
@@ -112,7 +127,8 @@ class HdcClient(
             throw HdcException("HDC did not confirm creation of the UITest forward.")
         }
         journal.confirmLayoutForward(port)
-        return port.takeIf { hasUitestLayoutForward(deviceId, it, remaining()) }
+        return if (hasUitestLayoutForward(deviceId, port, remaining())) LayoutForward(port, "automatic_forward")
+        else LayoutForward(null, "forward_unverified")
     }
 
     /** Reconcile only the registered local port. An exact but unconfirmed rule needs operator review. */

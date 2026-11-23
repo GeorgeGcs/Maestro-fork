@@ -230,11 +230,24 @@ class Maestro(
     ) {
         LOGGER.info("Tapping on element: ${tapRepeat ?: ""} $element")
 
-        val settledHierarchy = waitForAppToSettle(initialHierarchy, appId, waitToSettleTimeoutMs)
+        val afterScroll = if (driver is maestro.drivers.HarmonyOSDriver && recentScroll &&
+            !retryIfNoChange && !waitUntilVisible && !longPress && tapRepeat == null && waitToSettleTimeoutMs == null &&
+            driver.hasRecentHierarchy(initialHierarchy)
+        ) {
+            delay(ELEMENT_STABILITY_POLL_INTERVAL_MS)
+            val freshHierarchy = viewHierarchy()
+            unchangedHarmonyScrollTarget(element.treeNode, initialHierarchy, freshHierarchy)
+                ?.let { freshHierarchy to it }
+        } else null
+        val settledHierarchy = if (afterScroll == null) waitForAppToSettle(initialHierarchy, appId, waitToSettleTimeoutMs)
+            else null
 
         // Scroll momentum is the one motion that routinely outlives a null settle, so re-stabilise
         // only after a scroll (MA-4124); otherwise trust the hierarchy we have (MA-4135).
-        val (hierarchyBeforeTap, refreshedElement) = if (settledHierarchy == null && recentScroll) {
+        val (hierarchyBeforeTap, refreshedElement) = if (afterScroll != null) {
+            LOGGER.info("Tap aimed via confirmed HarmonyOS scroll target")
+            afterScroll
+        } else if (settledHierarchy == null && recentScroll) {
             LOGGER.info("Tap aimed via stabilised hierarchy (null settle after a scroll)")
             refreshElementUntilStable(element, initialHierarchy)
         } else {
@@ -803,6 +816,21 @@ class Maestro(
         // Mirrors IOSDriver.SCREEN_SETTLE_TIMEOUT_MS (3000ms): the element-stability wait
         // stands in for the settle confirmation the iOS driver could not give, so keep the
         // two budgets aligned when tuning either.
+        internal fun unchangedHarmonyScrollTarget(
+            target: TreeNode,
+            before: ViewHierarchy,
+            after: ViewHierarchy,
+        ): UiElement? {
+            if (target.attributes["hostWindowId"].isNullOrBlank() ||
+                target.attributes["accessibilityId"].isNullOrBlank()) return null
+            val initial = before.refreshElement(target) ?: return null
+            val latest = after.refreshElement(target) ?: return null
+            if (initial.enabled != true || latest.enabled != true ||
+                initial.attributes["bounds"] != latest.attributes["bounds"] ||
+                !before.isVisible(initial) || !after.isVisible(latest)) return null
+            return latest.toUiElementOrNull()
+        }
+
         private const val ELEMENT_STABILITY_TIMEOUT_MS: Long = 3000
         private const val ELEMENT_STABILITY_POLL_INTERVAL_MS: Long = 100
 

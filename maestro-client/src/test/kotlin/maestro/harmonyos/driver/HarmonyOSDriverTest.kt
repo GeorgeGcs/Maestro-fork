@@ -22,6 +22,23 @@ import java.time.Instant
 import javax.imageio.ImageIO
 
 class HarmonyOSDriverTest {
+    @Test fun `scroll target must be uniquely visible in the same position and window`() {
+        val target = maestro.TreeNode(mutableMapOf(
+            "hostWindowId" to "1", "accessibilityId" to "7", "bounds" to "[0,0][20,20]",
+        ), enabled = true)
+        fun snapshot(vararg children: maestro.TreeNode) = maestro.ViewHierarchy(maestro.TreeNode(children = children.toList()))
+        val before = snapshot(target)
+        val after = snapshot(maestro.TreeNode(mutableMapOf("bounds" to "[40,40][60,60]")), target)
+        assertThat(maestro.Maestro.unchangedHarmonyScrollTarget(target, before, after)?.treeNode).isEqualTo(target)
+
+        val moved = target.copy(attributes = (target.attributes + ("bounds" to "[20,20][40,40]")).toMutableMap())
+        val otherWindow = target.copy(attributes = (target.attributes + ("hostWindowId" to "2")).toMutableMap())
+        val coversTarget = maestro.TreeNode(mutableMapOf("bounds" to "[0,0][20,20]"))
+        for (changed in listOf(snapshot(moved), snapshot(target, target), snapshot(otherWindow), snapshot(target, coversTarget))) {
+            assertThat(maestro.Maestro.unchangedHarmonyScrollTarget(target, before, changed)).isNull()
+        }
+    }
+
     @Test
     fun `open verifies screenshot and layout then close rejects actions`() {
         val device = Device()

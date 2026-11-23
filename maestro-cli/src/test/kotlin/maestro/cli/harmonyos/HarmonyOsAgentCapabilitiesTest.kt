@@ -18,6 +18,8 @@ class HarmonyOsAgentCapabilitiesTest {
         var calls = 0
         val shell = mutableListOf<List<String>>()
         var bundle = ""
+        var rpcListener: Boolean? = null
+        override fun layoutRpcListener(deviceId: String) = rpcListener
         override fun devices(): List<String> { calls++; discoveryFailure?.let { throw it }; return targets }
         override fun lockStatus(deviceId: String) = lock
         override fun execute(deviceId: String, arguments: List<String>): String {
@@ -73,6 +75,22 @@ class HarmonyOsAgentCapabilitiesTest {
         val screen = preflight(probe, """{"deviceId":"test-target","commands":["tapOn"]}""")
         assertEquals("unknown", screen["readiness"].asText())
         assertTrue(screen["checks"].any { it["name"].asText() == "screenUnlocked" && it["status"].asText() == "unknown" })
+    }
+
+    @Test fun `RPC listener observation remains optional for file-backed commands`() {
+        val probe = Probe()
+        for ((listener, code) in listOf(
+            true to "UITEST_RPC_LISTENER_PRESENT",
+            false to "UITEST_RPC_LISTENER_MISSING",
+            null to "UITEST_RPC_LISTENER_UNKNOWN",
+        )) {
+            probe.rpcListener = listener
+            val result = preflight(probe, """{"deviceId":"test-target","commands":["tapOn"]}""")
+            val check = result["checks"].first { it["name"].asText() == "layoutRpcListener" }
+            assertEquals("unknown", result["readiness"].asText())
+            assertFalse(check["required"].asBoolean())
+            assertEquals(code, check["code"].asText())
+        }
     }
 
     @Test fun `keyboard dismissal is advertised for flows without claiming device readiness`() {

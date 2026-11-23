@@ -299,6 +299,7 @@ class Orchestra(
         initAndroidChromeDevTools(config)
 
         onFlowStart(commands)
+        (maestro.driver as? HarmonyOSDriver)?.logLayoutBackend()
         dispatch("onFlowStart") { it.onFlowStart() }
         val traceArtifacts = ExecutionTraceArtifacts(artifactsGenerator::allocateFlowLog,
             artifactsGenerator::refreshManifest, { artifactsGenerator.artifactManifest })

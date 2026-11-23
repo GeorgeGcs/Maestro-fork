@@ -326,17 +326,28 @@ class HarmonyOSDriver(
         }
     }
 
-    override fun waitForAppToSettle(initialHierarchy: ViewHierarchy?, appId: String?, timeoutMs: Int?): ViewHierarchy? {
-        requireOpen()
-        val deadline = deadline(timeoutMs?.toLong() ?: config.settleTimeout.toMillis())
-        val sample = lastHierarchy
-        lastHierarchy = null
-        val info = lastDeviceInfo
-        var previous = sample?.root?.takeIf { root ->
-            initialHierarchy != null && info != null &&
+    fun logLayoutBackend() {
+        (device as? HdcHarmonyOSDevice)?.logLayoutBackend()
+    }
+
+    internal fun hasRecentHierarchy(initialHierarchy: ViewHierarchy): Boolean =
+        recentHierarchyMatching(initialHierarchy) != null
+
+    private fun recentHierarchyMatching(initialHierarchy: ViewHierarchy?): TreeNode? {
+        val sample = lastHierarchy ?: return null
+        val info = lastDeviceInfo ?: return null
+        return sample.root.takeIf { root ->
+            initialHierarchy != null &&
                 System.nanoTime() - sample.finishedAt <= config.pollInterval.toNanos().coerceAtLeast(250_000_000) &&
                 (root.filterOutOfBounds(info.widthGrid, info.heightGrid) ?: root) == initialHierarchy.root
         }
+    }
+
+    override fun waitForAppToSettle(initialHierarchy: ViewHierarchy?, appId: String?, timeoutMs: Int?): ViewHierarchy? {
+        requireOpen()
+        val deadline = deadline(timeoutMs?.toLong() ?: config.settleTimeout.toMillis())
+        var previous = recentHierarchyMatching(initialHierarchy)
+        lastHierarchy = null
         var previousSampleNanos = 0L
         // Reuse a matching pre-action sample from this driver. Input invalidates the sample.
         // Post-action settling still needs two fresh samples.
