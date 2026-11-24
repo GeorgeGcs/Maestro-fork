@@ -716,15 +716,14 @@ class Orchestra(
         val execution = executingCommands.lastOrNull()
         if (!evaluateCondition(command.condition, timeoutMs = timeout, commandOptional = command.optional,
                 onVisibleAssertion = if (shareHierarchy) { selector, lookupTimeout ->
-                    val (_, filter) = buildFilter(selector)
-                    val cached = previous?.takeIf {
+                    val reusable = selector.usesOnlyHierarchyFilters()
+                    val cached = if (reusable) previous?.takeIf {
                         System.nanoTime() - it.readAt <= TimeUnit.MILLISECONDS.toNanos(250) &&
-                            selector.childOf == null &&
-                            filter(it.hierarchy.aggregate()).firstOrNull()?.toUiElementOrNull() != null
-                    }
-                    assertionSample = cached ?: findElement(selector, command.optional, lookupTimeout).let {
-                        AssertionSample(it.hierarchy, System.nanoTime())
-                    }
+                            matchInHierarchy(selector, it.hierarchy) != null
+                    } else null
+                    assertionSample = cached ?: findElement(
+                        selector, command.optional, lookupTimeout, retainFullHierarchy = reusable,
+                    ).takeIf { reusable }?.let { AssertionSample(it.hierarchy, System.nanoTime()) }
                 } else null,
                 onElementWait = if (execution != null && maestro.driver is HarmonyOSDriver) { observation ->
                     execution.elementWaits.add(observation)
@@ -1731,6 +1730,7 @@ class Orchestra(
         optional: Boolean,
         timeoutMs: Long? = null,
         captureHierarchyOnFailure: Boolean = true,
+        retainFullHierarchy: Boolean = false,
     ): FindElementResult {
         val timeout =
             timeoutMs ?: adjustedToLatestInteraction(
@@ -1745,8 +1745,7 @@ class Orchestra(
             var fullHierarchy = ViewHierarchy(TreeNode())
             val found = MaestroTimer.withTimeoutSuspend(timeout) {
                 fullHierarchy = maestro.viewHierarchy()
-                val parentHierarchy = resolveParentHierarchy(parentSelector, fullHierarchy)
-                parentHierarchy?.let { filterFunc(it.aggregate()).firstOrNull()?.toUiElementOrNull() }
+                matchInHierarchy(selector, fullHierarchy, filterFunc)
             }
             if (found == null) {
                 // Both "parent never matched" and "parent matched but child isn't in it" leave `found`
@@ -1784,7 +1783,7 @@ class Orchestra(
                     debugMessage = childOfDebugMessage
                 )
             }
-            return FindElementResult(found, ViewHierarchy(found.treeNode))
+            return FindElementResult(found, if (retainFullHierarchy) fullHierarchy else ViewHierarchy(found.treeNode))
         }
 
 
@@ -1853,6 +1852,19 @@ class Orchestra(
 
         return listOfNotNull(whatFailed, elsewhere).joinToString(" ") + "\n\nPossible causes:\n" + causes
     }
+
+    private fun matchInHierarchy(
+        selector: ElementSelector,
+        hierarchy: ViewHierarchy,
+        filter: ElementFilter = buildFilter(selector).filterFunc,
+    ): UiElement? = resolveParentHierarchy(selector.childOf, hierarchy)?.let {
+        filter(it.aggregate()).firstOrNull()?.toUiElementOrNull()
+    }
+
+    private fun ElementSelector.usesOnlyHierarchyFilters(): Boolean =
+        css == null && listOfNotNull(childOf, containsChild, above, below, leftOf, rightOf)
+            .all { it.usesOnlyHierarchyFilters() } &&
+            containsDescendants.orEmpty().all { it.usesOnlyHierarchyFilters() }
 
     private fun resolveParentHierarchy(
         selector: ElementSelector?,

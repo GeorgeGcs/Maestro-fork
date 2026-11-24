@@ -80,6 +80,42 @@ class HarmonyOSDriverTest {
     }
 
     @Test
+    fun `retry tap stops after a change visible only in the screenshot`() = runBlocking {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+        try {
+            device.beforeScreenshot = {
+                if (device.commands.isNotEmpty()) {
+                    device.image = png(80, 120, java.awt.Color.WHITE)
+                }
+            }
+            Maestro(driver).tap(14, 14, retryIfNoChange = true)
+            assertThat(device.commands).containsExactly(listOf("uitest", "uiInput", "click", "14", "14"))
+            assertThat(device.screenshots).isEqualTo(3)
+        } finally {
+            driver.close()
+        }
+    }
+
+    @Test
+    fun `retry tap repeats once when layout and pixels are unchanged`() = runBlocking {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+        try {
+            Maestro(driver).tap(14, 14, retryIfNoChange = true)
+            assertThat(device.commands).containsExactly(
+                listOf("uitest", "uiInput", "click", "14", "14"),
+                listOf("uitest", "uiInput", "click", "14", "14"),
+            )
+            assertThat(device.screenshots).isEqualTo(4)
+        } finally {
+            driver.close()
+        }
+    }
+
+    @Test
     fun `open verifies screenshot and layout then close rejects actions`() {
         val device = Device()
         val driver = driver(device)
@@ -796,8 +832,16 @@ class HarmonyOSDriverTest {
     companion object {
         private fun tree(text: String) = TreeNode(attributes = mutableMapOf("text" to text))
 
-        private fun png(width: Int, height: Int): ByteArray = ByteArrayOutputStream().use { out ->
-            ImageIO.write(BufferedImage(width, height, BufferedImage.TYPE_INT_RGB), "png", out)
+        private fun png(width: Int, height: Int, color: java.awt.Color = java.awt.Color.BLACK): ByteArray = ByteArrayOutputStream().use { out ->
+            val image = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
+            val graphics = image.createGraphics()
+            try {
+                graphics.color = color
+                graphics.fillRect(0, 0, width, height)
+            } finally {
+                graphics.dispose()
+            }
+            ImageIO.write(image, "png", out)
             out.toByteArray()
         }
     }

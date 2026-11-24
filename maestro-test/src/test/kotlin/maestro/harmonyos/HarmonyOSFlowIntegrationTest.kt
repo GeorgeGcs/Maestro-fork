@@ -61,6 +61,17 @@ class HarmonyOSFlowIntegrationTest {
     }
 
     @Test
+    fun `positive assertions with a parent reuse the original full layout`() {
+        withFlow("scoped-assertions.yaml") { flow ->
+            val before = flow.device.layoutCount
+            assertThat(runBlocking { flow.orchestra.runFlow(flow.commands) }.success).isTrue()
+            // One read serves both scoped assertions and the plain assertion after them.
+            assertThat(flow.device.layoutCount - before).isEqualTo(1)
+            assertThat(flow.device.remoteFiles).isEmpty()
+        }
+    }
+
+    @Test
     fun `scrollUntilVisible waits for full visibility and taps the refreshed input bounds`() {
         withFlow("scroll-flow.yaml") { flow ->
             val result = runBlocking { flow.orchestra.runFlow(flow.commands) }
@@ -221,6 +232,7 @@ class HarmonyOSFlowIntegrationTest {
         val RESOURCES = listOf(
             "flow.yaml", "enter-name.yaml", "assertion-failure.yaml", "remote-failure.yaml", "unsupported.yaml",
             "scroll-flow.yaml", "enter-scroll-name.yaml", "scroll-not-found.yaml", "sequential-flows.yaml",
+            "scoped-assertions.yaml",
         )
     }
 }

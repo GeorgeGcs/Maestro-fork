@@ -43,7 +43,7 @@ class ArkWebLoopbackTest {
     }
 
     @Test
-    fun `an explicit page matches only its URL and rechecks the device forward`() {
+    fun `an explicit page checks its marker on every read and rechecks the forward after the reuse window`() {
         val json = ObjectMapper()
         MockWebServer().use { server ->
             server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
@@ -64,12 +64,24 @@ class ArkWebLoopbackTest {
                     )))
                 }
             }))
-            ArkWebLoopback(server.port, HarmonyOSArkWebTarget("probe-secondary", "https://example.test/two")).use { browser ->
+            var now = 0L
+            val target = HarmonyOSArkWebTarget("probe-secondary", "https://example.test/two")
+            ArkWebLoopback(server.port, target, nowNanos = { now }).use { browser ->
                 val bounds = listOf(0, 0, 100, 100)
                 val timeout = Duration.ofSeconds(2)
                 assertThat(browser.snapshot(bounds, timeout) { true }?.attributes?.get("text")).isEqualTo("page two")
                 assertThat(server.takeRequest().path).isEqualTo("/json/list")
                 assertThat(server.takeRequest().path).isEqualTo("/devtools/page/two")
+                now += Duration.ofMillis(10).toNanos()
+                assertThat(browser.snapshot(bounds, timeout) { error("forward already verified") }
+                    ?.attributes?.get("text")).isEqualTo("page two")
+                var rechecked = false
+                assertThat(browser.snapshot(bounds, timeout) {
+                    rechecked = true
+                    true
+                }?.attributes?.get("text")).isEqualTo("page two")
+                assertThat(rechecked).isTrue()
+                now += Duration.ofSeconds(2).toNanos()
                 assertThat(browser.snapshot(bounds, timeout) { false }).isNull()
                 assertThat(server.requestCount).isEqualTo(2)
             }

@@ -17,7 +17,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /** Reads a test WebView through an already configured, device-verified HDC forward. */
-internal class ArkWebLoopback(private val port: Int, private val target: HarmonyOSArkWebTarget? = null) : AutoCloseable {
+internal class ArkWebLoopback(
+    private val port: Int,
+    private val target: HarmonyOSArkWebTarget? = null,
+    private val nowNanos: () -> Long = System::nanoTime,
+) : AutoCloseable {
     private val endpoint = "127.0.0.1:$port"
     private val logger = LoggerFactory.getLogger(ArkWebLoopback::class.java)
     private var connection: Connection? = null
@@ -51,20 +55,33 @@ internal class ArkWebLoopback(private val port: Int, private val target: Harmony
             if (nanos <= 0) throw java.util.concurrent.TimeoutException("ArkWeb snapshot deadline expired")
             return Duration.ofNanos(nanos)
         }
-        var active = connection?.takeIf { !it.failed && System.nanoTime() - it.openedAt < FORWARD_TTL_NANOS }
-        if ((active == null || target != null) && !verifyForward(remaining())) {
-            logger.debug("ArkWeb device forward not verified")
-            close()
-            return null
+        var active = connection?.takeIf { !it.failed && nowNanos() - it.openedAt < FORWARD_TTL_NANOS }
+        val needsVerification = active == null || (target != null &&
+            (active.reusedVerification || nowNanos() - active.verifiedAt >= EXPLICIT_FORWARD_REUSE_NANOS))
+        var verifiedAt = active?.verifiedAt ?: 0L
+        if (needsVerification) {
+            if (!measurePhase("device-forward") { verifyForward(remaining()) }) {
+                logger.debug("ArkWeb device forward not verified")
+                close()
+                return null
+            }
+            verifiedAt = nowNanos()
+            active?.apply {
+                this.verifiedAt = verifiedAt
+                reusedVerification = false
+            }
+        } else if (target != null) {
+            checkNotNull(active).reusedVerification = true
+            logger.info("HarmonyOS ArkWeb phase=device-forward-reused elapsedMs=0")
         }
         if (active == null) {
             close()
-            val path = discoverPage(remaining())
+            val path = measurePhase("page-discovery") { discoverPage(remaining()) }
             if (path == null) {
                 logger.debug("ArkWeb page discovery did not confirm a unique loopback target")
                 return null
             }
-            active = Connection()
+            active = Connection(nowNanos(), verifiedAt)
             active.socket = client.newWebSocket(Request.Builder().url("ws://$endpoint$path").build(), active)
             connection = active
         }
@@ -84,18 +101,30 @@ internal class ArkWebLoopback(private val port: Int, private val target: Harmony
         val pending = Pending(id, CompletableFuture())
         active.pending.set(pending)
         return try {
-            check(!active.failed && active.socket.send(payload)) { "Could not send ArkWeb snapshot request" }
-            val snapshot = pending.result.get(remaining().toNanos(), TimeUnit.NANOSECONDS)
-            if (snapshot.isEmpty() || snapshot == "null") {
-                logger.debug("ArkWeb page returned no verified DOM snapshot")
-                close()
-                null
-            } else json.readValue(snapshot, TreeNode::class.java)
+            measurePhase("dom") {
+                check(!active.failed && active.socket.send(payload)) { "Could not send ArkWeb snapshot request" }
+                val snapshot = pending.result.get(remaining().toNanos(), TimeUnit.NANOSECONDS)
+                if (snapshot.isEmpty() || snapshot == "null") {
+                    logger.debug("ArkWeb page returned no verified DOM snapshot")
+                    close()
+                    null
+                } else json.readValue(snapshot, TreeNode::class.java)
+            }
         } catch (error: Exception) {
             close()
             throw error
         } finally {
             active.pending.compareAndSet(pending, null)
+        }
+    }
+
+    private inline fun <T> measurePhase(phase: String, action: () -> T): T {
+        val started = System.nanoTime()
+        try {
+            return action()
+        } finally {
+            logger.info("HarmonyOS ArkWeb phase={} elapsedMs={}", phase,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started))
         }
     }
 
@@ -107,9 +136,9 @@ internal class ArkWebLoopback(private val port: Int, private val target: Harmony
 
     private data class Pending(val id: Long, val result: CompletableFuture<String>)
 
-    private class Connection : WebSocketListener() {
+    private class Connection(val openedAt: Long, var verifiedAt: Long) : WebSocketListener() {
         lateinit var socket: WebSocket
-        val openedAt = System.nanoTime()
+        var reusedVerification = false
         val pending = AtomicReference<Pending?>()
         @Volatile var failed = false
             private set
@@ -140,6 +169,9 @@ internal class ArkWebLoopback(private val port: Int, private val target: Harmony
 
     private companion object {
         val FORWARD_TTL_NANOS = TimeUnit.SECONDS.toNanos(5)
+        // Only the next read on an already verified socket can reuse the proof.
+        // URL and WebView marker are still checked for every DOM read.
+        val EXPLICIT_FORWARD_REUSE_NANOS = TimeUnit.SECONDS.toNanos(2)
         const val MAX_JSON_BYTES = 4L * 1024 * 1024
         val client = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).followRedirects(false).build()
         val json = jacksonObjectMapper()

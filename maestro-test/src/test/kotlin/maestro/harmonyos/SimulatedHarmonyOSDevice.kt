@@ -23,6 +23,8 @@ internal class SimulatedHarmonyOSDevice(
 
     var state = State.HOME
         private set
+    var layoutCount = 0
+        private set
     var tapCount = 0
         private set
     val inputValues = mutableListOf<String>()
@@ -110,6 +112,7 @@ internal class SimulatedHarmonyOSDevice(
         }
         arguments.take(3) == listOf("uitest", "dumpLayout", "-p") -> {
             check(arguments.size == 4)
+            layoutCount++
             remoteFiles[arguments[3]] = mapper.writeValueAsBytes(layout())
             hostSuccess("Dump layout saved\n")
         }
@@ -204,7 +207,7 @@ internal class SimulatedHarmonyOSDevice(
                 )
             }
         }
-        return node(bounds = "[0,0][$WIDTH,$HEIGHT]", children = children)
+        return node(id = "fixture-root", bounds = "[0,0][$WIDTH,$HEIGHT]", children = children)
     }
 
     private fun node(

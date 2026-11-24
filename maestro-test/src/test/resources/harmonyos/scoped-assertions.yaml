@@ -1,0 +1,12 @@
+appId: ${APP_ID}
+---
+- assertVisible:
+    id: open-form
+    childOf:
+      id: fixture-root
+- assertVisible:
+    id: open-scroll-form
+    childOf:
+      id: fixture-root
+- assertVisible:
+    id: open-form
