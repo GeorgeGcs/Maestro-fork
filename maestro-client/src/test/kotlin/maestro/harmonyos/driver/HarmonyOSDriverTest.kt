@@ -1,11 +1,14 @@
 package maestro.harmonyos.driver
 
 import com.google.common.truth.Truth.assertThat
+import kotlinx.coroutines.runBlocking
 import maestro.KeyCode
+import maestro.Maestro
 import maestro.Point
 import maestro.ScreenRecording
 import maestro.SwipeDirection
 import maestro.TreeNode
+import maestro.UiElement.Companion.toUiElement
 import maestro.ViewHierarchy
 import maestro.device.Platform
 import maestro.drivers.HarmonyOSDriver
@@ -22,20 +25,57 @@ import java.time.Instant
 import javax.imageio.ImageIO
 
 class HarmonyOSDriverTest {
-    @Test fun `scroll target must be uniquely visible in the same position and window`() {
-        val target = maestro.TreeNode(mutableMapOf(
+    @Test fun `tap target must remain unique visible enabled and in the same window`() {
+        val child = TreeNode(mutableMapOf("hostWindowId" to "1", "bounds" to "[5,5][15,15]"))
+        val target = TreeNode(mutableMapOf(
             "hostWindowId" to "1", "accessibilityId" to "7", "bounds" to "[0,0][20,20]",
-        ), enabled = true)
-        fun snapshot(vararg children: maestro.TreeNode) = maestro.ViewHierarchy(maestro.TreeNode(children = children.toList()))
+        ), children = listOf(child), enabled = true)
+        fun snapshot(vararg children: TreeNode) = ViewHierarchy(TreeNode(children = children.toList()))
         val before = snapshot(target)
-        val after = snapshot(maestro.TreeNode(mutableMapOf("bounds" to "[40,40][60,60]")), target)
-        assertThat(maestro.Maestro.unchangedHarmonyScrollTarget(target, before, after)?.treeNode).isEqualTo(target)
+        val after = snapshot(TreeNode(mutableMapOf("bounds" to "[40,40][60,60]")), target)
+        assertThat(Maestro.unchangedHarmonyTarget(target, before, after)?.treeNode).isEqualTo(target)
 
         val moved = target.copy(attributes = (target.attributes + ("bounds" to "[20,20][40,40]")).toMutableMap())
+        val duplicate = target.copy(attributes = (target.attributes + ("text" to "Another target")).toMutableMap())
         val otherWindow = target.copy(attributes = (target.attributes + ("hostWindowId" to "2")).toMutableMap())
-        val coversTarget = maestro.TreeNode(mutableMapOf("bounds" to "[0,0][20,20]"))
-        for (changed in listOf(snapshot(moved), snapshot(target, target), snapshot(otherWindow), snapshot(target, coversTarget))) {
-            assertThat(maestro.Maestro.unchangedHarmonyScrollTarget(target, before, changed)).isNull()
+        val coversTarget = TreeNode(mutableMapOf("hostWindowId" to "1", "bounds" to "[0,0][20,20]"))
+        val addedWindow = TreeNode(mutableMapOf("hostWindowId" to "2", "bounds" to "[60,60][70,70]"))
+        val changedChild = target.copy(children = listOf(child.copy(attributes = (child.attributes +
+            ("text" to "New label")).toMutableMap())))
+        val changedSnapshots = listOf(
+            snapshot(moved), snapshot(target, duplicate), snapshot(otherWindow),
+            snapshot(target, coversTarget), snapshot(target, addedWindow),
+            snapshot(target.copy(enabled = false)), snapshot(changedChild),
+        )
+        for (changed in changedSnapshots) {
+            assertThat(Maestro.unchangedHarmonyTarget(target, before, changed)).isNull()
+        }
+    }
+
+    @Test fun `plain tap checks the target once after locating it`() = runBlocking {
+        val device = Device().apply { size = 80 to 120 }
+        val driver = driver(device)
+        driver.open()
+        try {
+            val maestro = Maestro(driver)
+            val target = TreeNode(mutableMapOf(
+                "hostWindowId" to "1", "accessibilityId" to "7", "bounds" to "[4,4][24,24]",
+            ), enabled = true)
+            fun page(label: String) = TreeNode(children = listOf(target, TreeNode(
+                mutableMapOf("text" to label, "bounds" to "[40,40][60,60]"),
+            )))
+            device.layout = { page("before") }
+            val hierarchy = maestro.viewHierarchy()
+            val beforeTap = device.layoutReads
+            device.layout = { page("changed elsewhere") }
+
+            maestro.tap(hierarchy.root.children.first().toUiElement(), hierarchy)
+
+            assertThat(device.layoutReads - beforeTap).isEqualTo(3)
+            assertThat(device.commands).containsExactly(listOf("uitest", "uiInput", "click", "14", "14"))
+            assertThat(device.screenshots).isEqualTo(1) // Session probe only.
+        } finally {
+            driver.close()
         }
     }
 

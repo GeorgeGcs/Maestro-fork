@@ -230,24 +230,29 @@ class Maestro(
     ) {
         LOGGER.info("Tapping on element: ${tapRepeat ?: ""} $element")
 
-        val afterScroll = if (driver is maestro.drivers.HarmonyOSDriver && recentScroll &&
+        var settleFrom = initialHierarchy
+        val confirmedTarget = if (driver is maestro.drivers.HarmonyOSDriver &&
             !retryIfNoChange && !waitUntilVisible && !longPress && tapRepeat == null && waitToSettleTimeoutMs == null &&
-            hasHarmonyScrollIdentity(element.treeNode) && element.treeNode.enabled == true &&
-            initialHierarchy.isVisible(element.treeNode) && driver.hasRecentHierarchy(initialHierarchy)
+            hasHarmonyTargetIdentity(element.treeNode) && harmonyHit(initialHierarchy, element) != null &&
+            driver.hasRecentHierarchy(initialHierarchy)
         ) {
             delay(ELEMENT_STABILITY_POLL_INTERVAL_MS)
             val freshHierarchy = viewHierarchy()
-            unchangedHarmonyScrollTarget(element.treeNode, initialHierarchy, freshHierarchy)
+            settleFrom = freshHierarchy
+            unchangedHarmonyTarget(element.treeNode, initialHierarchy, freshHierarchy)
                 ?.let { freshHierarchy to it }
         } else null
-        val settledHierarchy = if (afterScroll == null) waitForAppToSettle(initialHierarchy, appId, waitToSettleTimeoutMs)
+        val settledHierarchy = if (confirmedTarget == null) waitForAppToSettle(settleFrom, appId, waitToSettleTimeoutMs)
             else null
 
         // Scroll momentum is the one motion that routinely outlives a null settle, so re-stabilise
         // only after a scroll (MA-4124); otherwise trust the hierarchy we have (MA-4135).
-        val (hierarchyBeforeTap, refreshedElement) = if (afterScroll != null) {
-            LOGGER.info("Tap aimed via confirmed HarmonyOS scroll target")
-            afterScroll
+        val (hierarchyBeforeTap, refreshedElement) = if (confirmedTarget != null) {
+            LOGGER.info(
+                if (recentScroll) "Tap aimed via confirmed HarmonyOS scroll target"
+                else "Tap aimed via confirmed HarmonyOS target"
+            )
+            confirmedTarget
         } else if (settledHierarchy == null && recentScroll) {
             LOGGER.info("Tap aimed via stabilised hierarchy (null settle after a scroll)")
             refreshElementUntilStable(element, initialHierarchy)
@@ -817,21 +822,42 @@ class Maestro(
         // Mirrors IOSDriver.SCREEN_SETTLE_TIMEOUT_MS (3000ms): the element-stability wait
         // stands in for the settle confirmation the iOS driver could not give, so keep the
         // two budgets aligned when tuning either.
-        private fun hasHarmonyScrollIdentity(node: TreeNode) =
+        private fun hasHarmonyTargetIdentity(node: TreeNode) =
             !node.attributes["hostWindowId"].isNullOrBlank() && !node.attributes["accessibilityId"].isNullOrBlank()
 
-        internal fun unchangedHarmonyScrollTarget(
+        private fun harmonyHit(hierarchy: ViewHierarchy, element: UiElement): TreeNode? {
+            if (element.treeNode.enabled != true) return null
+            val center = element.bounds.center()
+            val hit = hierarchy.getElementAt(hierarchy.root, center.x, center.y) ?: return null
+            // A named container can be hit through an icon or label inside the same window.
+            return hit.takeIf {
+                it.enabled != false && it.attributes["hostWindowId"] == element.treeNode.attributes["hostWindowId"] &&
+                    element.treeNode.aggregate().any { node -> node === it }
+            }
+        }
+
+        internal fun unchangedHarmonyTarget(
             target: TreeNode,
             before: ViewHierarchy,
             after: ViewHierarchy,
         ): UiElement? {
-            if (!hasHarmonyScrollIdentity(target)) return null
-            val initial = before.refreshElement(target) ?: return null
-            val latest = after.refreshElement(target) ?: return null
-            if (initial.enabled != true || latest.enabled != true ||
-                initial.attributes["bounds"] != latest.attributes["bounds"] ||
-                !before.isVisible(initial) || !after.isVisible(latest)) return null
-            return latest.toUiElementOrNull()
+            if (!hasHarmonyTargetIdentity(target)) return null
+            val window = target.attributes["hostWindowId"]
+            val id = target.attributes["accessibilityId"]
+            val beforeNodes = before.aggregate()
+            val afterNodes = after.aggregate()
+            fun windows(nodes: List<TreeNode>) = nodes.mapNotNull { it.attributes["hostWindowId"] }.distinct()
+            if (windows(beforeNodes) != windows(afterNodes)) return null
+
+            fun findTarget(nodes: List<TreeNode>) = nodes.singleOrNull {
+                it.attributes["hostWindowId"] == window && it.attributes["accessibilityId"] == id
+            }?.takeIf { it.attributes == target.attributes }?.toUiElementOrNull()
+
+            val initial = findTarget(beforeNodes) ?: return null
+            val latest = findTarget(afterNodes) ?: return null
+            val initialHit = harmonyHit(before, initial) ?: return null
+            val latestHit = harmonyHit(after, latest) ?: return null
+            return latest.takeIf { initialHit.attributes == latestHit.attributes }
         }
 
         private const val ELEMENT_STABILITY_TIMEOUT_MS: Long = 3000
