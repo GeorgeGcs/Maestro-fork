@@ -142,6 +142,7 @@ class OrchestraListenerDispatchTest {
         val driver = mockk<HarmonyOSDriver>()
         val maestro = mockMaestro()
         every { maestro.driver } returns driver
+        every { driver.logLayoutBackend() } returns Unit
         every { driver.strictFaultDiagnostics } returns (scenario == "strict")
         every { driver.flowFaults("com.target", any(), any()) } answers {
             val at = secondArg<Long>()
@@ -168,6 +169,7 @@ class OrchestraListenerDispatchTest {
             assertThat(tempDir.resolve("logs/${DeviceArtifactFiles.CRASH_REPORT}").toFile().readText()).contains("matched crash")
             assertThat(tempDir.resolve("logs/${DeviceArtifactFiles.ANR_REPORT}").toFile().readText()).contains("matched freeze")
         }
+        verify(exactly = 1) { driver.logLayoutBackend() }
         coVerify(exactly = 0) { maestro.collectCrashArtifacts(any(), any(), any()) }
     }
 
