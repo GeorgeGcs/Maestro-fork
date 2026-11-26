@@ -18,6 +18,8 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.time.Duration
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.UUID
 
 class HarmonyOSCommandException(
@@ -40,6 +42,7 @@ class HdcHarmonyOSDevice(
     private val arkWebBundle: String? = null,
     private val arkWebTarget: HarmonyOSArkWebTarget? = null,
     private val automaticLayoutRpc: Boolean = false,
+    private val requireLayoutRpc: Boolean = false,
 ) : HarmonyOSDevice {
     private var layoutChannel: LoopbackLayoutChannel? = null
     private var layoutReason = "not_connected"
@@ -51,12 +54,14 @@ class HdcHarmonyOSDevice(
     private var reportedArkWebSource: String? = null
     private val arkWeb = arkWebPort?.let { ArkWebLoopback(it, arkWebTarget) }
     private var arkWebWindow: String? = null
+    private var verifiedArkWebLayout: VerifiedArkWebLayout? = null
 
     override fun disconnect() {
         layoutChannel?.close()
         layoutChannel = null
         displayRpcUnsupported = false
         reportedArkWebSource = null
+        verifiedArkWebLayout = null
         arkWeb?.close()
         arkWebWindow = null
     }
@@ -78,6 +83,9 @@ class HdcHarmonyOSDevice(
         layoutReason = forward.reason
         layoutChannel = forward.port?.let(::LoopbackLayoutChannel)
         logLayoutBackend()
+        if (requireLayoutRpc && layoutChannel == null) {
+            throw HdcException("Required UITest layout RPC unavailable: $layoutReason")
+        }
     }
 
     override fun isAvailable(): Boolean = deviceId in hdc.listDevices()
@@ -246,60 +254,12 @@ class HdcHarmonyOSDevice(
         }, config, hdc.recordingResources()).start(out)
 
     override fun hierarchy(timeout: Duration): TreeNode {
+        verifiedArkWebLayout = null
         val deadline = System.nanoTime() + timeout.toNanos()
-        layoutChannel?.let { channel ->
-            val rpcBudget = minOf(timeout.dividedBy(2), Duration.ofSeconds(2))
-            if (rpcBudget >= Duration.ofMillis(1)) {
-                try {
-                    return enhanceArkWeb(channel.snapshot(rpcBudget), deadline, timeout)
-                } catch (error: HdcException) {
-                    disableLayoutRpc(channel, error)
-                } catch (error: UitestLayoutException) {
-                    disableLayoutRpc(channel, error)
-                }
-            }
-        }
-        val budget = remainingBudget(deadline, timeout)
-        val nativeTree = HierarchyReader(
-            hdc, deviceId,
-            commandTimeout = budget,
-            cleanupTimeout = Duration.ofSeconds(2),
-            totalTimeout = budget,
-        ).read()
-        return enhanceArkWeb(nativeTree, deadline, timeout)
-    }
-
-    private fun enhanceArkWeb(nativeTree: TreeNode, deadline: Long, timeout: Duration): TreeNode {
-        val port = arkWebPort ?: return nativeTree
-        val bundle = arkWebBundle ?: return nativeTree
-        val webViews = mutableListOf<TreeNode>()
-        fun findWebViews(node: TreeNode, owner: String?) {
-            val actualOwner = node.attributes["bundleName"]?.takeIf { it.isNotBlank() } ?: owner
-            if (node.attributes["class"] == "Web" && actualOwner == bundle &&
-                (arkWebTarget == null || node.attributes["resource-id"] == arkWebTarget.webViewId)
-            ) webViews += node
-            node.children.forEach { findWebViews(it, actualOwner) }
-        }
-        findWebViews(nativeTree, null)
-        val webView = webViews.singleOrNull()
-        val bounds = webView?.attributes?.get("bounds")
-            ?.let { Regex("""\[(-?\d+),(-?\d+)]\[(-?\d+),(-?\d+)]""").matchEntire(it) }
-            ?.groupValues?.drop(1)?.map(String::toInt)
-        if (webView == null || bounds == null) return arkWebFallback(nativeTree)
-        val window = webView.attributes["hostWindowId"]
-        if (arkWebWindow != window) {
-            arkWeb?.close()
-            arkWebWindow = window
-        }
-
+        val nativeTree = nativeHierarchy(deadline, timeout)
+        val target = findArkWebTarget(nativeTree) ?: return arkWebFallback(nativeTree)
         val dom = try {
-            val budget = minOf(remainingBudget(deadline, timeout), Duration.ofSeconds(3))
-            arkWeb?.snapshot(bounds, budget) { verificationBudget ->
-                val webDeadline = System.nanoTime() + verificationBudget.toNanos()
-                val pid = execute(listOf("pidof", bundle), remainingBudget(webDeadline, verificationBudget))
-                pid.matches(Regex("[1-9][0-9]*")) &&
-                    hdc.hasArkWebForward(deviceId, port, pid, remainingBudget(webDeadline, verificationBudget))
-            }
+            readArkWeb(target, deadline, timeout) { bounds, budget, verify -> snapshot(bounds, budget, verify) }
         } catch (error: InterruptedException) {
             Thread.currentThread().interrupt()
             throw error
@@ -310,12 +270,108 @@ class HdcHarmonyOSDevice(
         } ?: return arkWebFallback(nativeTree)
 
         reportArkWebSource("DOM")
-        fun merge(node: TreeNode): TreeNode = if (node === webView) {
+        verifiedArkWebLayout = VerifiedArkWebLayout(target, dom)
+        fun merge(node: TreeNode): TreeNode = if (node === target.node) {
             node.copy(children = listOf(dom))
         } else {
             node.copy(children = node.children.map(::merge))
         }
         return merge(nativeTree)
+    }
+
+    override fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<TreeNode>): List<TreeNode> {
+        if (arkWeb == null || arkWebBundle == null) {
+            throw UnsupportedOperationException("CSS selectors require a configured ArkWeb debugging target.")
+        }
+        check(reportedArkWebSource == "DOM") { "CSS selectors require an available ArkWeb DOM hierarchy." }
+        val deadline = System.nanoTime() + timeout.toNanos()
+        val reused = verifiedArkWebLayout?.takeIf { it.matches(hierarchyNodes) }
+        val target = reused?.target ?: findArkWebTarget(nativeHierarchy(deadline, timeout))
+            ?: error("CSS query could not identify the active ArkWeb target.")
+        logger.info("HarmonyOS ArkWeb CSS native layout={}", if (reused == null) "fresh" else "reused")
+        check(arkWebWindow == target.node.attributes["hostWindowId"]) { "ArkWeb window changed during CSS lookup." }
+        return readArkWeb(target, deadline, timeout) { bounds, budget, verify ->
+            queryCss(selector, bounds, budget, verify)
+        } ?: error("CSS query could not read the verified ArkWeb page.")
+    }
+
+    private fun nativeHierarchy(deadline: Long, timeout: Duration): TreeNode {
+        layoutChannel?.let { channel ->
+            val rpcBudget = minOf(timeout.dividedBy(2), Duration.ofSeconds(2))
+            if (rpcBudget >= Duration.ofMillis(1)) {
+                try {
+                    return channel.snapshot(rpcBudget)
+                } catch (error: HdcException) {
+                    disableLayoutRpc(channel, error)
+                } catch (error: UitestLayoutException) {
+                    disableLayoutRpc(channel, error)
+                }
+            }
+        }
+        if (requireLayoutRpc) throw HdcException("Required UITest layout RPC could not read the hierarchy: $layoutReason")
+        val budget = remainingBudget(deadline, timeout)
+        return HierarchyReader(
+            hdc, deviceId,
+            commandTimeout = budget,
+            cleanupTimeout = Duration.ofSeconds(2),
+            totalTimeout = budget,
+        ).read()
+    }
+
+    private data class ArkWebView(val node: TreeNode, val bounds: List<Int>)
+
+    private class VerifiedArkWebLayout(val target: ArkWebView, dom: TreeNode) {
+        private val capturedAt = System.nanoTime()
+        // Bounds filtering keeps the original attributes map even when it copies a node.
+        private val attributes by lazy {
+            dom.aggregate().mapTo(Collections.newSetFromMap(IdentityHashMap<Map<String, String>, Boolean>())) { it.attributes }
+        }
+
+        fun matches(nodes: List<TreeNode>): Boolean = nodes.isNotEmpty() &&
+            System.nanoTime() - capturedAt <= Duration.ofMillis(250).toNanos() &&
+            nodes.any { it.attributes in attributes }
+    }
+
+    private fun findArkWebTarget(nativeTree: TreeNode): ArkWebView? {
+        if (arkWebPort == null) return null
+        val bundle = arkWebBundle ?: return null
+        val webViews = mutableListOf<TreeNode>()
+        fun findWebViews(node: TreeNode, owner: String?) {
+            val actualOwner = node.attributes["bundleName"]?.takeIf { it.isNotBlank() } ?: owner
+            if (node.attributes["class"] == "Web" && actualOwner == bundle &&
+                (arkWebTarget == null || node.attributes["resource-id"] == arkWebTarget.webViewId)
+            ) webViews += node
+            node.children.forEach { findWebViews(it, actualOwner) }
+        }
+        findWebViews(nativeTree, null)
+        val webView = webViews.singleOrNull() ?: return null
+        val bounds = webView.attributes["bounds"]
+            ?.let { Regex("""\[(-?\d+),(-?\d+)]\[(-?\d+),(-?\d+)]""").matchEntire(it) }
+            ?.groupValues?.drop(1)?.map(String::toInt) ?: return null
+        return ArkWebView(webView, bounds)
+    }
+
+    private fun <T> readArkWeb(
+        target: ArkWebView,
+        deadline: Long,
+        timeout: Duration,
+        read: ArkWebLoopback.(List<Int>, Duration, (Duration) -> Boolean) -> T?,
+    ): T? {
+        val port = checkNotNull(arkWebPort)
+        val bundle = checkNotNull(arkWebBundle)
+        val window = target.node.attributes["hostWindowId"]
+        if (arkWebWindow != window) {
+            arkWeb?.close()
+            arkWebWindow = window
+        }
+
+        val budget = minOf(remainingBudget(deadline, timeout), Duration.ofSeconds(3))
+        return checkNotNull(arkWeb).read(target.bounds, budget) { verificationBudget ->
+            val webDeadline = System.nanoTime() + verificationBudget.toNanos()
+            val pid = execute(listOf("pidof", bundle), remainingBudget(webDeadline, verificationBudget))
+            pid.matches(Regex("[1-9][0-9]*")) &&
+                hdc.hasArkWebForward(deviceId, port, pid, remainingBudget(webDeadline, verificationBudget))
+        }
     }
 
     private fun arkWebFallback(nativeTree: TreeNode): TreeNode {

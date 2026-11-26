@@ -301,6 +301,7 @@ object Filters {
             val matchingNodes = runBlocking { maestro.findElementsByOnDeviceQuery(
                 timeoutMs = 5000,
                 query = OnDeviceElementQuery.Css(css = cssSelector),
+                hierarchyNodes = nodes,
             ) }?.elements?.map { it.treeNode } ?: emptyList()
 
             // The on-device CSS query traverses only the matched element (no descendants),

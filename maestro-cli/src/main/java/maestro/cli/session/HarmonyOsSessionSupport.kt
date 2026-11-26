@@ -136,6 +136,11 @@ internal object HarmonyOsSessionSupport {
                 "false" -> false
                 else -> throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_AUTO must be true or false.")
             },
+            requireLayoutRpc = when (environment["MAESTRO_HARMONYOS_LAYOUT_RPC_REQUIRED"]?.trim()) {
+                null, "", "false" -> false
+                "true" -> true
+                else -> throw CliError("MAESTRO_HARMONYOS_LAYOUT_RPC_REQUIRED must be true or false.")
+            },
         )
 
     fun <T> withSession(

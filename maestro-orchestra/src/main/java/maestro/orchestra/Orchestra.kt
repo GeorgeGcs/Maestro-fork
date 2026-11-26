@@ -2001,17 +2001,23 @@ class Orchestra(
                 basicFilters += Filters.focused(it)
             }
 
-        selector.css
-            ?.let {
-                descriptions += "CSS: $it"
-                basicFilters += Filters.css(maestro, it)
-            }
+        val cssFilter = selector.css?.let {
+            descriptions += "CSS: $it"
+            Filters.css(maestro, it)
+        }
 
         // Apply deepestMatchingElement only to basic filters, then intersect with relative filters
-        val basicFilter = if (basicFilters.isNotEmpty()) {
-            Filters.deepestMatchingElement(Filters.intersect(basicFilters))
-        } else {
-            { nodes -> nodes } // Identity filter if no basic filters
+        val basicFilter: ElementFilter = when {
+            cssFilter != null && maestro.driver is HarmonyOSDriver -> { nodes ->
+                // Read the verified WebView once. The deepest-element walk tests
+                // individual nodes, so it must use in-memory membership checks.
+                val cssMatches = cssFilter(nodes).toSet()
+                val matchesCss: ElementFilter = { candidates -> candidates.filter { it in cssMatches } }
+                Filters.deepestMatchingElement(Filters.intersect(basicFilters + matchesCss))(nodes)
+            }
+            cssFilter != null -> Filters.deepestMatchingElement(Filters.intersect(basicFilters + cssFilter))
+            basicFilters.isNotEmpty() -> Filters.deepestMatchingElement(Filters.intersect(basicFilters))
+            else -> { nodes -> nodes }
         }
         
         val allFilters = listOf(basicFilter) + relativeFilters

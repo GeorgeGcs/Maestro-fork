@@ -47,8 +47,35 @@ internal class ArkWebLoopback(
         }
     }
 
+    fun snapshot(bounds: List<Int>, timeout: Duration, verifyForward: (Duration) -> Boolean): TreeNode? =
+        read(bounds, timeout, "window.maestro.getContentDescription()", verifyForward)
+            ?.let { json.readValue(it, TreeNode::class.java) }
+
+    fun queryCss(
+        selector: String,
+        bounds: List<Int>,
+        timeout: Duration,
+        verifyForward: (Duration) -> Boolean,
+    ): List<TreeNode>? {
+        val argument = json.writeValueAsString(selector)
+        val operation = """(() => {
+            try { return window.maestro.queryCss($argument); }
+            catch (error) { if (error.name === 'SyntaxError') return 'invalid-css'; throw error; }
+        })()"""
+        val result = read(bounds, timeout, operation, verifyForward) ?: return null
+        val nodes = json.readTree(result)
+        require(!nodes.isTextual || nodes.textValue() != "invalid-css") { "Invalid ArkWeb CSS selector." }
+        check(nodes.isArray) { "ArkWeb returned an invalid CSS result." }
+        return nodes.filterNot { it.isNull }.map { json.treeToValue(it, TreeNode::class.java) }
+    }
+
     @Synchronized
-    fun snapshot(bounds: List<Int>, timeout: Duration, verifyForward: (Duration) -> Boolean): TreeNode? {
+    private fun read(
+        bounds: List<Int>,
+        timeout: Duration,
+        operation: String,
+        verifyForward: (Duration) -> Boolean,
+    ): String? {
         val deadline = System.nanoTime() + timeout.toNanos()
         fun remaining(): Duration {
             val nanos = deadline - System.nanoTime()
@@ -88,7 +115,7 @@ internal class ArkWebLoopback(
         val (left, top, right, bottom) = bounds
         val capture = "$script; maestro.viewportX = $left; maestro.viewportY = $top;" +
             " maestro.viewportWidth = ${right - left}; maestro.viewportHeight = ${bottom - top};" +
-            " JSON.stringify(window.maestro.getContentDescription(), window.maestro.cycleSafeReplacer());"
+            " JSON.stringify($operation, window.maestro.cycleSafeReplacer());"
         val expression = if (target == null) capture else {
             val url = json.writeValueAsString(target.pageUrl)
             val webViewId = json.writeValueAsString(target.webViewId)
@@ -108,7 +135,7 @@ internal class ArkWebLoopback(
                     logger.debug("ArkWeb page returned no verified DOM snapshot")
                     close()
                     null
-                } else json.readValue(snapshot, TreeNode::class.java)
+                } else snapshot
             }
         } catch (error: Exception) {
             close()

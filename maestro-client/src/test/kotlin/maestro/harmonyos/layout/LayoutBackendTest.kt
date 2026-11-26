@@ -6,6 +6,10 @@ import maestro.harmonyos.driver.HdcHarmonyOSDevice
 import maestro.harmonyos.hdc.HdcClient
 import maestro.harmonyos.hdc.HdcCommandResult
 import maestro.harmonyos.hdc.HdcCommandRunner
+import maestro.harmonyos.hdc.HdcException
+import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import org.junit.jupiter.api.Test
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -45,10 +49,20 @@ class LayoutBackendTest {
     }
 
     @Test
-    fun `a failed RPC read closes the socket and falls back for the session`() {
+    fun `required RPC rejects a forward for another device without dumping layout`() {
+        val fixture = HdcFixture(12345, "OTHER-DEVICE")
+        val device = fixture.device(requireLayoutRpc = true)
+        val error = assertThrows(HdcException::class.java) { device.connect() }
+        assertThat(error).hasMessageThat().contains("explicit_forward_unavailable")
+        assertThat(fixture.dumps).isEqualTo(0)
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = [false, true])
+    fun `a failed RPC read closes the socket and honors the fallback policy`(requireLayoutRpc: Boolean) {
         listener().use { server ->
             val fixture = HdcFixture(server.localPort)
-            val device = fixture.device()
+            val device = fixture.device(requireLayoutRpc = requireLayoutRpc)
             val executor = Executors.newSingleThreadExecutor()
             try {
                 val peer = executor.submit {
@@ -62,10 +76,16 @@ class LayoutBackendTest {
                     }
                 }
                 device.connect()
-                assertThat(device.hierarchy(budget).attributes["text"]).isEqualTo("HDC")
-                assertThat(device.hierarchy(budget).attributes["text"]).isEqualTo("HDC")
+                repeat(2) {
+                    if (requireLayoutRpc) {
+                        val error = assertThrows(HdcException::class.java) { device.hierarchy(budget) }
+                        assertThat(error).hasMessageThat().contains("rpc_read_failed")
+                    } else {
+                        assertThat(device.hierarchy(budget).attributes["text"]).isEqualTo("HDC")
+                    }
+                }
                 peer.get(5, TimeUnit.SECONDS)
-                assertThat(fixture.dumps).isEqualTo(2)
+                assertThat(fixture.dumps).isEqualTo(if (requireLayoutRpc) 0 else 2)
             } finally {
                 device.disconnect()
                 executor.shutdownNow()
@@ -145,7 +165,7 @@ class LayoutBackendTest {
     private inner class HdcFixture(private val port: Int, private val owner: String = deviceId) {
         var dumps = 0
 
-        fun device(): HdcHarmonyOSDevice {
+        fun device(requireLayoutRpc: Boolean = false): HdcHarmonyOSDevice {
             val runner = HdcCommandRunner { command, _ ->
                 val response = when {
                     command.drop(1) == listOf("list", "targets") -> deviceId
@@ -160,7 +180,7 @@ class LayoutBackendTest {
                 }
                 HdcCommandResult(0, response, "")
             }
-            return HdcHarmonyOSDevice(deviceId, HdcClient("hdc", runner), port)
+            return HdcHarmonyOSDevice(deviceId, HdcClient("hdc", runner), port, requireLayoutRpc = requireLayoutRpc)
         }
     }
 }

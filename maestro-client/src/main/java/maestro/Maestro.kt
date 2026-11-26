@@ -582,17 +582,25 @@ class Maestro(
 
     suspend fun findElementsByOnDeviceQuery(
         timeoutMs: Long,
-        query: OnDeviceElementQuery
+        query: OnDeviceElementQuery,
+        hierarchyNodes: List<TreeNode> = emptyList(),
     ): OnDeviceElementQueryResult? {
-        return MaestroTimer.withTimeoutSuspend(timeoutMs) {
+        suspend fun queryOnce(): OnDeviceElementQueryResult? {
             val result = runInterruptible(Dispatchers.IO) {
-                val elements = driver.queryOnDeviceElements(query)
+                val elements = when (val currentDriver = driver) {
+                    is maestro.drivers.HarmonyOSDriver -> currentDriver.queryOnDeviceElements(query, hierarchyNodes)
+                    else -> currentDriver.queryOnDeviceElements(query)
+                }
                 OnDeviceElementQueryResult(
                     elements = elements.mapNotNull { it.toUiElementOrNull() },
                 )
             }
-            if (result.elements.isNotEmpty()) result else null
+            return result.takeIf { it.elements.isNotEmpty() }
         }
+        // HarmonyOS queries the verified WebView alongside each fresh hierarchy.
+        // Let the enclosing element lookup poll, so a no-match uses one DOM request.
+        if (driver is maestro.drivers.HarmonyOSDriver) return queryOnce()
+        return MaestroTimer.withTimeoutSuspend(timeoutMs) { queryOnce() }
     }
 
     suspend fun allElementsMatching(filter: ElementFilter): List<TreeNode> {

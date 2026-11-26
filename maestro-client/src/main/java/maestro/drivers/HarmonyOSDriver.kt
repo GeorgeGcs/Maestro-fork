@@ -4,6 +4,7 @@ import maestro.Capability
 import maestro.DeviceInfo
 import maestro.Driver
 import maestro.KeyCode
+import maestro.OnDeviceElementQuery
 import maestro.Point
 import maestro.ScreenRecording
 import maestro.SwipeDirection
@@ -54,7 +55,7 @@ class HarmonyOSDriver(
         config: HarmonyOSDriverConfig = HarmonyOSDriverConfig(),
     ) : this(HdcHarmonyOSDevice(deviceId, hdc, config.layoutRpcPort.also {
         require(it == null || deviceId == config.layoutRpcDevice) { "Layout RPC target differs from the selected device" }
-    }, config.arkWebPort, config.arkWebBundle, config.arkWebTarget, config.automaticLayoutRpc), config)
+    }, config.arkWebPort, config.arkWebBundle, config.arkWebTarget, config.automaticLayoutRpc, config.requireLayoutRpc), config)
 
     @Volatile private var opened = false
     private var recording: ScreenRecording? = null
@@ -242,7 +243,20 @@ class HarmonyOSDriver(
     override fun contentDescriptor(excludeKeyboardElements: Boolean): TreeNode {
         requireOpen()
         if (excludeKeyboardElements) unsupported("excluding keyboard elements from the hierarchy")
-        return hierarchy().also { lastHierarchy = HierarchySample(it, System.nanoTime()) }
+        return query { device.hierarchy(config.commandTimeout).also { lastHierarchy = HierarchySample(it, System.nanoTime()) } }
+    }
+
+    override fun queryOnDeviceElements(query: OnDeviceElementQuery): List<TreeNode> =
+        queryOnDeviceElements(query, emptyList())
+
+    internal fun queryOnDeviceElements(query: OnDeviceElementQuery, hierarchyNodes: List<TreeNode>): List<TreeNode> {
+        requireOpen()
+        return when (query) {
+            is OnDeviceElementQuery.Css -> query {
+                val scope = if (lastHierarchy == null) emptyList() else hierarchyNodes
+                device.queryCss(query.css, config.commandTimeout, scope)
+            }
+        }
     }
 
     override fun scrollVertical() = swipe(SwipeDirection.UP, 400)

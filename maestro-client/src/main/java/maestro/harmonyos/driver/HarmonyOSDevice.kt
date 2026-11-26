@@ -22,6 +22,8 @@ interface HarmonyOSDevice {
         throw UnsupportedOperationException("This HarmonyOS device backend does not support media import.")
     fun flowFaults(appId: String, startMs: Long, endMs: Long, timeout: Duration): HarmonyOSFlowFaults? = null
     fun hierarchy(timeout: Duration): TreeNode
+    fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<TreeNode> = emptyList()): List<TreeNode> =
+        throw UnsupportedOperationException("This HarmonyOS device backend does not support CSS selectors.")
     fun screenshot(timeout: Duration): ByteArray
     fun execute(arguments: List<String>, timeout: Duration): String
     fun startScreenRecording(out: Sink, config: HarmonyOSDriverConfig): ScreenRecording =

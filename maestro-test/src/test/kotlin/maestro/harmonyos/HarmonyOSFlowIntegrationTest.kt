@@ -8,7 +8,9 @@ import maestro.MaestroException
 import maestro.Point
 import maestro.drivers.HarmonyOSDriver
 import maestro.harmonyos.driver.HarmonyOSCommandException
+import maestro.harmonyos.driver.HarmonyOSDevice
 import maestro.harmonyos.driver.HarmonyOSDriverConfig
+import maestro.harmonyos.driver.HdcHarmonyOSDevice
 import maestro.harmonyos.hdc.HdcClient
 import maestro.orchestra.MaestroCommand
 import maestro.orchestra.Orchestra
@@ -68,6 +70,30 @@ class HarmonyOSFlowIntegrationTest {
             // One read serves both scoped assertions and the plain assertion after them.
             assertThat(flow.device.layoutCount - before).isEqualTo(1)
             assertThat(flow.device.remoteFiles).isEmpty()
+        }
+    }
+
+    @Test
+    fun `CSS queries once per lookup and an unavailable page cannot pass a negative assertion`() {
+        var positiveReads = 0
+        withFlow("css-assertions.yaml", deviceBackend = { backing ->
+            object : HarmonyOSDevice by backing {
+                override fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<maestro.TreeNode>): List<maestro.TreeNode> {
+                    if (selector == ".missing") error("CSS query could not read the verified ArkWeb page.")
+                    check(selector == "#open-form")
+                    positiveReads++
+                    return hierarchyNodes
+                        .filter { it.attributes["resource-id"] == "open-form" }
+                        .map { it.copy(children = emptyList()) }
+                }
+            }
+        }) { flow ->
+            val failure = assertThrows<IllegalStateException> {
+                runBlocking { flow.orchestra.runFlow(flow.commands) }
+            }
+            assertThat(failure.message).contains("verified ArkWeb page")
+            assertThat(positiveReads).isEqualTo(1)
+            assertThat(flow.device.tapCount).isEqualTo(0)
         }
     }
 
@@ -180,6 +206,7 @@ class HarmonyOSFlowIntegrationTest {
     private fun withFlow(
         filename: String,
         device: SimulatedHarmonyOSDevice = SimulatedHarmonyOSDevice(),
+        deviceBackend: (HarmonyOSDevice) -> HarmonyOSDevice = { it },
         block: (FlowFixture) -> Unit,
     ) {
         TempFileHandler().use { temporary ->
@@ -195,8 +222,9 @@ class HarmonyOSFlowIntegrationTest {
             val commands = YamlCommandReader.readCommands(workspace.resolve(filename), scope)
                 .withEnv(mapOf("APP_ID" to APP_ID, "INPUT_TEXT" to INPUT_TEXT))
             val driver = HarmonyOSDriver(
-                deviceId = SimulatedHarmonyOSDevice.DEVICE_ID,
-                hdc = HdcClient(executablePath = "simulated-hdc", runner = device),
+                device = deviceBackend(HdcHarmonyOSDevice(
+                    SimulatedHarmonyOSDevice.DEVICE_ID, HdcClient(executablePath = "simulated-hdc", runner = device),
+                )),
                 config = HarmonyOSDriverConfig(
                     abilityName = "EntryAbility",
                     commandTimeout = Duration.ofSeconds(2),
@@ -233,6 +261,7 @@ class HarmonyOSFlowIntegrationTest {
             "flow.yaml", "enter-name.yaml", "assertion-failure.yaml", "remote-failure.yaml", "unsupported.yaml",
             "scroll-flow.yaml", "enter-scroll-name.yaml", "scroll-not-found.yaml", "sequential-flows.yaml",
             "scoped-assertions.yaml",
+            "css-assertions.yaml",
         )
     }
 }

@@ -8,9 +8,50 @@ import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Assertions.assertThrows
 import java.time.Duration
 
 class ArkWebLoopbackTest {
+    @Test
+    fun `CSS separates matches no matches and an invalid selector from a lost target`() {
+        val json = ObjectMapper()
+        val selector = """[data-testid="submit"]"""
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            server.enqueue(MockResponse().setBody(
+                """[{"type":"page","url":"https://example.test/two","webSocketDebuggerUrl":"ws://127.0.0.1:${server.port}/devtools/page/two"}]"""
+            ))
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val request = json.readTree(text)
+                    val expression = request.path("params").path("expression").asText()
+                    val value = when {
+                        !expression.contains("window.location.href === \"https://example.test/two\"") -> "null"
+                        expression.contains("window.maestro.queryCss(${json.writeValueAsString(selector)})") ->
+                            """[{"attributes":{"text":"Submit","bounds":"[5,5][30,30]"},"children":[]}]"""
+                        expression.contains("window.maestro.queryCss(\"[\"") -> "\"invalid-css\""
+                        else -> "[]"
+                    }
+                    webSocket.send(json.writeValueAsString(mapOf(
+                        "id" to request.path("id").asLong(),
+                        "result" to mapOf("result" to mapOf("value" to value)),
+                    )))
+                }
+            }))
+            val target = HarmonyOSArkWebTarget("probe-secondary", "https://example.test/two")
+            val bounds = listOf(0, 0, 100, 100)
+            val timeout = Duration.ofSeconds(2)
+            ArkWebLoopback(server.port, target).use { browser ->
+                assertThat(browser.queryCss(selector, bounds, timeout) { true }?.single()?.attributes?.get("text"))
+                    .isEqualTo("Submit")
+                assertThat(browser.queryCss(".absent", bounds, timeout) { true }).isEmpty()
+                assertThrows(IllegalArgumentException::class.java) { browser.queryCss("[", bounds, timeout) { true } }
+                assertThat(browser.queryCss(".absent", bounds, timeout) { false }).isEmpty()
+                assertThat(browser.queryCss(".absent", bounds, timeout) { false }).isNull()
+            }
+        }
+    }
+
     @Test
     fun `an established page connection reads new snapshots without repeating forward discovery`() {
         val json = ObjectMapper()

@@ -1,0 +1,10 @@
+appId: ${APP_ID}
+---
+- launchApp
+- assertVisible:
+    css: '#open-form'
+    text: 填写表单
+- assertNotVisible:
+    css: '.missing'
+- tapOn:
+    id: open-form
