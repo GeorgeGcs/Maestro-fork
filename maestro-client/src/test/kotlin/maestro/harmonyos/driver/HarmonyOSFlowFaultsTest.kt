@@ -15,7 +15,7 @@ class HarmonyOSFlowFaultsTest {
             {"name_":"CPP_CRASH","MODULE":"demo.target","time_":210,"SUMMARY":"after"}
             {"name_":"USER_ACTION","MODULE":"demo.target","time_":170}
         """.trimIndent()
-        val report = parseFlowFaults(output, "demo.target", 100, 200)
+        val report = parseFlowFaults(readFaultHistory(output, 256), "demo.target", 100, 200)
         assertThat(report.crash).isEqualTo(HarmonyOSFlowFault("JS_ERROR", 160, "latest crash"))
         assertThat(report.freeze).isEqualTo(HarmonyOSFlowFault("APP_FREEZE", 155, "main thread", occurredAt = true))
         assertThat(report.events.map { it.timeMs }).containsExactly(140L, 155L, 160L).inOrder()
@@ -28,7 +28,7 @@ class HarmonyOSFlowFaultsTest {
             {"name_":"JS_ERROR","PACKAGE_NAME":"demo.target","HAPPEN_TIME":141,"REASON":"uncertain boundary"}
             {"name_":"JS_ERROR","PACKAGE_NAME":"demo.target","HAPPEN_TIME":160,"PID":1234,"REASON":"threw","STACK":"details","LOG_PATH":"/an/untrusted/path"}
         """.trimIndent()
-        val report = parseFlowFaults(output, "demo.target", 150, 200, HarmonyOSFaultClock(3, 10))
+        val report = parseFlowFaults(readFaultHistory(output, 256), "demo.target", 150, 200, HarmonyOSFaultClock(3, 10))
         assertThat(report.events).containsExactly(
             HarmonyOSFlowFault("JS_ERROR", 160, "threw", mapOf("PID" to "1234", "STACK" to "details"), true),
         )

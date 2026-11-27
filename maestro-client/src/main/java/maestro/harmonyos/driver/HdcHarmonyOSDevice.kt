@@ -121,11 +121,20 @@ class HdcHarmonyOSDevice(
         // Broaden the device-side query for the offset interval. The parser admits only events provably in the Flow window.
         val deviceStart = startMs - (clock?.maximumOffsetMs ?: 0)
         val deviceEnd = endMs - (clock?.minimumOffsetMs ?: 0)
-        val output = diagnostic(
-            listOf("hisysevent", "-l", "-s", deviceStart.toString(), "-e", deviceEnd.toString(), "-g", "FAULT", "-m", "256"),
-            remainingBudget(deadline, timeout),
-        )
-        return parseFlowFaults(output, appId, startMs, endMs, clock)
+        // Shell event visibility may be applied after the store reads a page. A smaller page or
+        // a single publisher domain can hide a target crash that the original query would return.
+        val queryStarted = System.nanoTime()
+        val limit = 256
+        val output = try {
+            diagnostic(
+                listOf("hisysevent", "-l", "-s", deviceStart.toString(), "-e", deviceEnd.toString(), "-g", "FAULT", "-m", limit.toString()),
+                remainingBudget(deadline, timeout),
+            )
+        } finally {
+            logger.info("HarmonyOS fault history clockMs={} queryMs={}",
+                elapsed, Duration.ofNanos(System.nanoTime() - queryStarted).toMillis())
+        }
+        return parseFlowFaults(readFaultHistory(output, limit), appId, startMs, endMs, clock)
     }
 
     override fun displaySize(timeout: Duration): Pair<Int, Int>? {
@@ -295,6 +304,42 @@ class HdcHarmonyOSDevice(
         } ?: error("CSS query could not read the verified ArkWeb page.")
     }
 
+    override fun installHap(hap: HarmonyOSHap, replace: Boolean, timeout: Duration) {
+        val lines = execute(listOf("bm", "dump", "-a"), timeout).lineSequence()
+            .map(String::trim).filter(String::isNotEmpty).toList()
+        val header = lines.firstOrNull().orEmpty()
+        check((header == "All bundle names:" || header.matches(Regex("ID: [0-9]+:"))) && lines.drop(1).all {
+            it.matches(Regex("[A-Za-z0-9_][A-Za-z0-9_.]*"))
+        }) { "Could not confirm which bundles are installed." }
+        check(replace || hap.bundleId !in lines.drop(1)) { "The target bundle is already installed. An explicit --replace is required." }
+        hdc.installHap(deviceId, hap.path, replace, Duration.ofSeconds(120))
+        val metadata = execute(listOf("bm", "dump", "-n", hap.bundleId), timeout)
+        val version = HarmonyOSBundleMetadata.parse(metadata, hap.bundleId)?.path("versionCode")
+        check(version != null && version.isIntegralNumber && version.canConvertToLong() && version.longValue() == hap.versionCode) {
+            "HAP installation was acknowledged, but the installed bundle or version could not be verified."
+        }
+    }
+
+    override fun setAppPermission(appId: String, permission: String, allow: Boolean, timeout: Duration) {
+        val api = diagnostic(listOf("param", "get", "const.ohos.apiversion"), timeout).trim().toIntOrNull()
+        if (api == null || api < 26) throw UnsupportedOperationException("App permissions require HarmonyOS API 26 or later.")
+        fun readPermission(): HarmonyOSBundleMetadata.DebugPermission? {
+            val output = execute(listOf("bm", "dump", "-n", appId), timeout)
+            return HarmonyOSBundleMetadata.debugPermission(HarmonyOSBundleMetadata.parse(output, appId), permission)
+        }
+        val definition = diagnostic(listOf("atm", "dump", "-d", "-p", permission), timeout)
+        if (!HarmonyOSBundleMetadata.isUserGrant(definition, permission)) {
+            throw UnsupportedOperationException("Only a user_grant permission can be changed.")
+        }
+        val existing = readPermission()
+            ?: throw UnsupportedOperationException("A debug-signed bundle must declare the requested permission.")
+        val flag = if (allow) "-g" else "-c"
+        val result = execute(listOf("atm", "perm", flag, "-i", existing.tokenId.toString(), "-p", permission), timeout)
+        check(result.trim() == "Success") { "The device did not confirm the permission operation." }
+        val current = readPermission()
+        check(current == existing.copy(granted = allow)) { "The device did not verify the requested permission state." }
+    }
+
     private fun nativeHierarchy(deadline: Long, timeout: Duration): TreeNode {
         layoutChannel?.let { channel ->
             val rpcBudget = minOf(timeout.dividedBy(2), Duration.ofSeconds(2))
@@ -439,7 +484,9 @@ class HdcHarmonyOSDevice(
         if (status != 0) {
             throw HarmonyOSCommandException("Device command failed (exit $status)", output, result.stderr, status, transportFailure)
         }
-        if (DEVICE_FAILURE.containsMatchIn(output) || DEVICE_FAILURE.containsMatchIn(result.stderr)) {
+        if (DEVICE_FAILURE.containsMatchIn(output) || DEVICE_FAILURE.containsMatchIn(result.stderr) ||
+            (arguments.first() == "hisysevent" && result.stderr.isNotBlank())
+        ) {
             throw HarmonyOSCommandException("Device command reported a failure", output, result.stderr, status, transportFailure)
         }
         // ui_input.cpp returns EXIT_SUCCESS even for an ApiCallErr. Its successful message is

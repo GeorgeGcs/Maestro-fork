@@ -31,6 +31,7 @@ import maestro.cli.command.DownloadSamplesCommand
 import maestro.cli.command.DriverCommand
 import maestro.cli.command.HarmonyOsBridgeCommand
 import maestro.cli.command.HarmonyOsDevicePoolCommand
+import maestro.cli.command.HarmonyOsPrepareAppCommand
 import maestro.cli.command.HarmonyOsRecoveryCommand
 import maestro.cli.command.HarmonyOsCleanupRecoveryCommand
 import maestro.cli.command.ListCloudDevicesCommand
@@ -83,6 +84,7 @@ import kotlin.system.exitProcess
         McpCommand::class,
         HarmonyOsBridgeCommand::class,
         HarmonyOsDevicePoolCommand::class,
+        HarmonyOsPrepareAppCommand::class,
         HarmonyOsRecoveryCommand::class,
         HarmonyOsCleanupRecoveryCommand::class,
     ]
@@ -132,7 +134,9 @@ fun main(args: Array<String>) {
     // kotlin-logging's first-load message will otherwise land on the MCP JSON-RPC
     // channel and break the handshake for strict clients like Claude Desktop.
     if (args.firstOrNull() == "mcp") claimMcpStdout()
-    if (args.any { it == "harmonyos-bridge" || it == "harmonyos-device-pool" }) HarmonyOsBridgeStdout.claim()
+    if (args.any { it in setOf("harmonyos-bridge", "harmonyos-device-pool", "harmonyos-prepare-app") }) {
+        HarmonyOsBridgeStdout.claim()
+    }
 
     // Establish a consistent logging baseline for every command before any init
     // logging fires. Without this, commands that don't call TestDebugReporter.install()

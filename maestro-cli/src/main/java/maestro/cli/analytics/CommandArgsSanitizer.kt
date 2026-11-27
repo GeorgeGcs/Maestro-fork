@@ -30,6 +30,9 @@ object CommandArgsSanitizer {
         "--apiKey",
         "-e",
         "--env",
+        "--hap",
+        "--bundle",
+        "--sha256",
     )
 
     private val PATH_LIKE_EXTENSIONS: Set<String> = setOf(

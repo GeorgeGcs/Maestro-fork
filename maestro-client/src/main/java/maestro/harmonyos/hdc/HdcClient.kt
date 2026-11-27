@@ -242,6 +242,31 @@ class HdcClient(
     internal fun <T> externalMutation(arguments: List<String>, dispatch: () -> T): T =
         if (recoveryJournal == null) dispatch() else recoveryJournal.externalMutation(arguments, dispatch)
 
+    internal fun installHap(deviceId: String, hap: Path, replace: Boolean, timeout: Duration) {
+        validateDeviceId(deviceId)
+        recoveryJournal?.let { require(it.deviceId == deviceId) { "Recovery journal belongs to another target." } }
+        val arguments = listOf("-t", deviceId, "install") + (if (replace) listOf("-r") else emptyList()) +
+            hap.toAbsolutePath().toString()
+        val failureCode = externalMutation(arguments) {
+            val result = try {
+                execute(arguments, timeout, recoveryJournal != null, category = HdcCommandCategory.APP_INSTALL)
+            } catch (error: HdcCommandException) {
+                error.result
+            }
+            val status = result.stdout.lineSequence().map(String::trim).toList()
+            val success = status.count { it.endsWith("msg:install bundle successfully.") ||
+                it.endsWith("msg:install bundle successfully") } == 1
+            val failure = status.mapNotNull { Regex("msg:error: failed to install bundle\\. code:([0-9]+)(?: .*|$)")
+                .find(it)?.groupValues?.get(1) }.singleOrNull()
+            check(status.count { it == "AppMod finish" } == 1 && result.stderr.isBlank() &&
+                ((result.exitCode == 0 && success && failure == null) || (!success && failure != null))) {
+                "HDC did not confirm the outcome of the HAP installation."
+            }
+            failure
+        }
+        if (failureCode != null) throw HdcException("The device rejected the HAP (system code $failureCode).")
+    }
+
     internal fun sendGalleryFile(deviceId: String, local: Path, remote: String, bytes: Long, timeout: Duration) {
         validateDeviceId(deviceId)
         require(remote.matches(Regex("/mnt/data/[0-9]+/media_fuse/Photo/[A-Za-z0-9][A-Za-z0-9_.-]{0,180}")))
@@ -328,6 +353,10 @@ class HdcClient(
                     arguments[3].matches(Regex("[A-Za-z0-9_][A-Za-z0-9_.]*"))) ||
                 (arguments.size == 5 && arguments.take(4) == listOf("bm", "clean", "-d", "-n") &&
                     arguments[4].matches(Regex("[A-Za-z0-9_][A-Za-z0-9_.]*"))) ||
+                (arguments.size == 7 && arguments.take(2) == listOf("atm", "perm") &&
+                    arguments[2] in setOf("-g", "-c") && arguments[3] == "-i" &&
+                    (arguments[4].toLongOrNull() ?: 0L) in 1L..0xFFFF_FFFFL && arguments[5] == "-p" &&
+                    arguments[6].matches(Regex("ohos\\.permission\\.[A-Z][A-Z0-9_]*"))) ||
                 (arguments.take(3) == listOf("stat", "-c", "%s") && arguments.size == 4 && recordingScratch(arguments[3])) ||
                 (arguments.size == 3 && arguments[0] == "test" && arguments[1] in setOf("-L", "-e", "-f") && recordingScratch(arguments[2])) ||
                 (arguments.take(2) == listOf("mediatool", "query") && arguments.size == 4 &&

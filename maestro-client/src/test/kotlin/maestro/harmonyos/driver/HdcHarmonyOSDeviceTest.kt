@@ -13,10 +13,107 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import java.nio.file.Files
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.time.Duration
+import java.util.HexFormat
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 class HdcHarmonyOSDeviceTest {
+    @Test
+    fun `permissions require API 26 a debug bundle a user grant and explicit state readback`() {
+        val permission = "ohos.permission.CAMERA"
+        var api = "25"
+        var debug = false
+        var grantMode = "USER_GRANT"
+        var state = -1
+        var writes = 0
+        var changeReported = true
+        val device = device { args, _ ->
+            val input = args.last()
+            val output = when {
+                "const.ohos.apiversion" in input -> api
+                "atm" in input && "dump" in input -> """{"permissionName":"$permission","grantMode":"$grantMode"}"""
+                "bm" in input && "dump" in input -> """
+                    {"name":"org.example.demo","applicationInfo":{"appProvisionType":"${if (debug) "debug" else "release"}",
+                    "debug":$debug,"accessTokenId":4000000000},"reqPermissions":["$permission"],"reqPermissionStates":[$state]}
+                """.trimIndent()
+                else -> {
+                    assertThat(input).contains("atm")
+                    assertThat(input).contains("perm")
+                    assertThat(input).contains("4000000000")
+                    assertThat(input).contains(permission)
+                    writes++
+                    if (changeReported) state = if ("-g" in input) 0 else -1
+                    "Success"
+                }
+            }
+            HdcCommandResult(0, "$output\n${marker(args)}0\n", "")
+        }
+        fun change(allow: Boolean) = device.setAppPermission("org.example.demo", permission, allow, TIMEOUT)
+        assertThrows(UnsupportedOperationException::class.java) { change(true) }
+        api = "26"
+        assertThrows(UnsupportedOperationException::class.java) { change(true) }
+        debug = true
+        grantMode = "SYSTEM_GRANT"
+        assertThrows(UnsupportedOperationException::class.java) { change(true) }
+        assertThat(writes).isEqualTo(0)
+        grantMode = "USER_GRANT"
+        change(true)
+        change(false)
+        assertThat(state).isEqualTo(-1)
+        changeReported = false
+        assertThrows(IllegalStateException::class.java) { change(true) }
+    }
+
+    @Test
+    fun `preparing a pinned HAP verifies the bundle and version and requires opt in to replace`() {
+        TempFileHandler().use { files ->
+            val dir = files.createTempDirectory("maestro-hap-test").toPath()
+            val source = dir.resolve("fixture.hap")
+            val bundle = "org.example.demo"
+            ZipOutputStream(Files.newOutputStream(source)).use { archive ->
+                archive.putNextEntry(ZipEntry("module.json"))
+                archive.write("""{"app":{"bundleName":"$bundle","versionCode":7}}""".toByteArray())
+                archive.closeEntry()
+            }
+            val digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(source)))
+            assertThrows(IllegalArgumentException::class.java) {
+                HarmonyOSHap.stage(source, dir.resolve("rejected.hap"), bundle, "0".repeat(64))
+            }
+            val hap = HarmonyOSHap.stage(source, dir.resolve("staged.hap"), bundle, digest)
+            var installed = false
+            var installs = 0
+            var reject = false
+            val device = device { args, _ ->
+                if (args.getOrNull(3) == "install") {
+                    assertThat(args.last()).isEqualTo(hap.path.toAbsolutePath().toString())
+                    assertThat("-r" in args).isEqualTo(installed)
+                    installs++
+                    if (reject) {
+                        HdcCommandResult(1, "[Info]App install path:fixture msg:error: failed to install bundle. code:9568322 test\nAppMod finish\n", "")
+                    } else {
+                        installed = true
+                        HdcCommandResult(0, "[Info]App install path:fixture msg:install bundle successfully.\nAppMod finish\n", "")
+                    }
+                } else {
+                    val output = if ("'-a'" in args.last()) {
+                        if (installed) "ID: 100:\n$bundle" else "ID: 100:\n"
+                    } else """{"name":"$bundle","versionCode":7}"""
+                    HdcCommandResult(0, "$output\n${marker(args)}0\n", "")
+                }
+            }
+            device.installHap(hap, false, TIMEOUT)
+            assertThrows(IllegalStateException::class.java) { device.installHap(hap, false, TIMEOUT) }
+            assertThat(installs).isEqualTo(1)
+            device.installHap(hap, true, TIMEOUT)
+            reject = true
+            val failure = assertThrows(HdcException::class.java) { device.installHap(hap, true, TIMEOUT) }
+            assertThat(failure.message).contains("9568322")
+        }
+    }
+
     @Test
     fun `preview requests bounded pixels and explicit screenshots keep the original backend`() {
         val commands = mutableListOf<String>()
@@ -65,6 +162,60 @@ class HdcHarmonyOSDeviceTest {
         focus = 68
         assertThat(device.hasAppFocus("org.example.demo", TIMEOUT)).isTrue()
         assertThat(device.hasAppFocus("org.example", TIMEOUT)).isFalse()
+    }
+
+    @Test
+    fun `empty and populated fault windows each use one all-domain read with the full limit`() {
+        val names = listOf("CPP_CRASH", "JS_ERROR", "RUST_PANIC", "CJ_ERROR", "APP_CRASH", "APP_FREEZE")
+        val rows = names.mapIndexed { index, name ->
+            """{"domain_":"SOURCE_$index","name_":"$name","PACKAGE_NAME":"demo.target","time_":${100 + index}}"""
+        }
+        val other = """{"name_":"CPP_CRASH","PACKAGE_NAME":"another.app","time_":103}"""
+        var populated = false
+        val limits = mutableListOf<Int>()
+        val budgets = mutableListOf<Duration>()
+        val device = device { args, timeout ->
+            val command = args.last().replace("'\"'\"'", "'")
+            val output = if ("hisysevent" in command) {
+                assertThat(command).contains("'-l' '-s' '90' '-e' '110' '-g' 'FAULT'")
+                assertThat(command).doesNotContain("'-o'")
+                val limit = Regex("""'-m' '(\d+)'""").find(command)!!.groupValues[1].toInt()
+                limits += limit
+                budgets += timeout
+                if (populated) (rows + other).joinToString("\n") else ""
+            } else ""
+            HdcCommandResult(0, "$output\n${marker(args)}0\n", "")
+        }
+        assertThat(device.flowFaults("demo.target", 90, 110, TIMEOUT).events).isEmpty()
+        assertThat(limits).containsExactly(256)
+        limits.clear()
+        budgets.clear()
+        populated = true
+        val report = device.flowFaults("demo.target", 90, 110, TIMEOUT)
+        assertThat(limits).containsExactly(256)
+        assertThat(budgets.single()).isAtMost(TIMEOUT)
+        assertThat(report.events.map { it.event }).containsExactlyElementsIn(names).inOrder()
+    }
+
+    @Test
+    fun `fault query diagnostics never report invalid output or missing receipts as an empty history`() {
+        val row = """{"name_":"JS_ERROR","PACKAGE_NAME":"demo.target","time_":100}"""
+        fun read(output: String, stderr: String = "", receipt: Boolean = true) {
+            val device = device { args, _ ->
+                val isHistory = "hisysevent" in args.last()
+                val body = if (isHistory) output else ""
+                val status = if (!isHistory || receipt) "\n${marker(args)}0\n" else ""
+                HdcCommandResult(0, body + status, if (isHistory) stderr else "")
+            }
+            assertThrows(HdcException::class.java) { device.flowFaults("demo.target", 90, 110, TIMEOUT) }
+        }
+        read("failed to query system event: permission denied")
+        read("", stderr = "permission denied")
+        read("", receipt = false)
+        read("{broken")
+        read("{}")
+        read("$row garbage")
+        read(List(257) { row }.joinToString("\n"))
     }
 
     @Test

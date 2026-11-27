@@ -10,24 +10,47 @@ data class HarmonyOSLaunchTarget(val abilityName: String, val moduleName: String
 
 object HarmonyOSBundleMetadata {
     enum class DataClearSupport { SUPPORTED, UNSUPPORTED, UNKNOWN }
+    internal data class DebugPermission(val tokenId: Long, val granted: Boolean)
 
     private val mapper = ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
         .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
     private val identifier = Regex("[A-Za-z0-9_][A-Za-z0-9_.$]*")
 
     fun parse(output: String, appId: String): JsonNode? {
-        val start = output.indexOf('{')
-        if (start < 0) return null
-        val bundle = try {
-            mapper.readTree(output.substring(start))
-        } catch (_: JsonProcessingException) {
-            return null
-        }
-        if (!bundle.isObject) return null
+        val bundle = parseObject(output) ?: return null
         val names = listOf(bundle.get("name"), bundle.get("bundleName"), bundle.path("appInfo").get("bundleName"),
             bundle.path("applicationInfo").get("bundleName")).mapNotNull { it?.textValue() }
         return bundle.takeIf { appId in names && names.all { it == appId } }
     }
+
+    private fun parseObject(output: String): JsonNode? {
+        val start = output.indexOf('{')
+        if (start < 0) return null
+        return try {
+            mapper.readTree(output.substring(start))
+        } catch (_: JsonProcessingException) {
+            return null
+        }?.takeIf(JsonNode::isObject)
+    }
+
+    internal fun debugPermission(bundle: JsonNode?, permission: String): DebugPermission? {
+        if (bundle == null) return null
+        val app = bundle.get("applicationInfo") ?: bundle.get("appInfo") ?: return null
+        if (app.path("appProvisionType").textValue() != "debug" || !app.path("debug").booleanValue()) return null
+        val token = app.path("accessTokenId")
+        if (!token.isIntegralNumber || !token.canConvertToLong() || token.longValue() !in 1..0xFFFF_FFFFL) return null
+        val permissions = bundle.path("reqPermissions").takeIf(JsonNode::isArray) ?: return null
+        val states = bundle.path("reqPermissionStates")
+        if (!states.isArray || states.size() != permissions.size()) return null
+        val index = (0 until permissions.size()).singleOrNull { permissions[it].textValue() == permission } ?: return null
+        val state = states[index]
+        if (!state.isIntegralNumber || !state.canConvertToInt() || state.intValue() !in -1..0) return null
+        return DebugPermission(token.longValue(), state.intValue() == 0)
+    }
+
+    internal fun isUserGrant(output: String, permission: String): Boolean =
+        parseObject(output)?.let { it.path("permissionName").textValue() == permission &&
+            it.path("grantMode").textValue() == "USER_GRANT" } == true
 
     fun dataClearSupport(bundle: JsonNode?): DataClearSupport {
         val application = bundle?.get("applicationInfo") ?: bundle?.get("appInfo") ?: return DataClearSupport.UNKNOWN

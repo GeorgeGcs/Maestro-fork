@@ -1,6 +1,10 @@
 package maestro.harmonyos.driver
 
+import com.fasterxml.jackson.core.JsonProcessingException
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import maestro.harmonyos.hdc.HdcException
 
 data class HarmonyOSFlowFault(
     val event: String,
@@ -32,18 +36,29 @@ data class HarmonyOSFlowFaults(
     val clock: HarmonyOSFaultClock? = null,
 )
 
-private val mapper = ObjectMapper()
+private val mapper = ObjectMapper().enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
 private val crashEvents = setOf("CPP_CRASH", "JS_ERROR", "RUST_PANIC", "CJ_ERROR", "APP_CRASH")
 private val bundleFields = listOf("PACKAGE_NAME", "MODULE", "PROCESS_NAME", "PNAME", "bundle_name")
 // The event schema includes file paths for separate device logs. Keep only the inline diagnostics.
 private val diagnosticFields = listOf("PID", "SUB_EVENT_TYPE", "FINGERPRINT", "DIAG_INFO", "STACK",
     "FIRST_FRAME", "SECOND_FRAME", "LAST_FRAME", "SUMMARY", "MSG")
 
+internal fun readFaultHistory(output: String, limit: Int): List<JsonNode> {
+    val events = output.lineSequence().filterNot(String::isBlank).map { line ->
+        val event = try { mapper.readTree(line) } catch (_: JsonProcessingException) { null }
+        if (event == null || !event.path("name_").isTextual || event.path("name_").asText().isBlank()) {
+            throw HdcException("hisysevent returned an invalid fault history record.")
+        }
+        event
+    }.toList()
+    if (events.size > limit) throw HdcException("hisysevent exceeded the requested fault history limit.")
+    return events
+}
+
 internal fun parseFlowFaults(
-    output: String, appId: String, startMs: Long, endMs: Long, clock: HarmonyOSFaultClock? = null,
+    events: List<JsonNode>, appId: String, startMs: Long, endMs: Long, clock: HarmonyOSFaultClock? = null,
 ): HarmonyOSFlowFaults {
-    val faults = output.lineSequence().filter { it.trimStart().startsWith("{") }.mapNotNull { line ->
-        val event = runCatching { mapper.readTree(line) }.getOrNull() ?: return@mapNotNull null
+    val faults = events.asSequence().mapNotNull { event ->
         val name = event.path("name_").asText()
         if (name !in crashEvents && name != "APP_FREEZE") return@mapNotNull null
         val bundle = event.path("PACKAGE_NAME").asText().ifBlank { event.path("bundle_name").asText() }

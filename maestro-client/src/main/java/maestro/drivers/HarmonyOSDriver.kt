@@ -18,6 +18,7 @@ import maestro.harmonyos.driver.HarmonyOSCommandException
 import maestro.harmonyos.driver.HarmonyOSDevice
 import maestro.harmonyos.driver.HarmonyOSDriverConfig
 import maestro.harmonyos.driver.HarmonyOSFlowFaults
+import maestro.harmonyos.driver.HarmonyOSHap
 import maestro.harmonyos.driver.HarmonyOSHostFrameRecording
 import maestro.harmonyos.driver.HarmonyOSScreenFrame
 import maestro.harmonyos.driver.HdcHarmonyOSDevice
@@ -79,7 +80,7 @@ class HarmonyOSDriver(
 
     fun flowFaults(appId: String, startMs: Long, endMs: Long): HarmonyOSFlowFaults? = transport.withLock {
         if (!opened || queryFailure != null) null else
-            device.flowFaults(appId, startMs, endMs, minOf(config.commandTimeout, Duration.ofSeconds(6)))
+            device.flowFaults(appId, startMs, endMs, minOf(config.commandTimeout, Duration.ofSeconds(15)))
     }
 
     @Synchronized
@@ -259,6 +260,11 @@ class HarmonyOSDriver(
         }
     }
 
+    fun installHap(hap: HarmonyOSHap, replace: Boolean) {
+        requireOpen()
+        query { device.installHap(hap, replace, config.commandTimeout) }
+    }
+
     override fun scrollVertical() = swipe(SwipeDirection.UP, 400)
 
     override fun swipe(start: Point, end: Point, durationMs: Long) {
@@ -381,7 +387,15 @@ class HarmonyOSDriver(
 
     override fun setPermissions(appId: String, permissions: Map<String, String>) {
         requireOpen()
-        if (permissions.isNotEmpty()) unsupported("setting app permissions")
+        if (permissions.isEmpty()) return
+        requireIdentifier(appId, "Bundle name")
+        val permission = permissions.entries.singleOrNull()
+            ?: unsupported("changing multiple permissions at once")
+        if (!permission.key.matches(Regex("ohos\\.permission\\.[A-Z][A-Z0-9_]*")) ||
+            permission.value !in setOf("allow", "deny")) {
+            unsupported("permissions other than an explicit HarmonyOS permission with allow or deny")
+        }
+        query { device.setAppPermission(appId, permission.key, permission.value == "allow", config.commandTimeout) }
     }
 
     override fun clearAppState(appId: String) {

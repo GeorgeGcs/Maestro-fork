@@ -130,12 +130,7 @@ internal class HarmonyOSHostFrameRecording(
         val canvasWidth = ((width * ratio).toInt() / 2 * 2).coerceAtLeast(2)
         val canvasHeight = ((height * ratio).toInt() / 2 * 2).coerceAtLeast(2)
         val errors = directory.resolve("ffmpeg.log")
-        val encoder = ProcessBuilder(ffmpeg.toString(), "-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
-            "-f", "concat", "-safe", "1", "-i", manifest.toString(), "-an", "-vf",
-            "scale=$canvasWidth:$canvasHeight:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=$canvasWidth:$canvasHeight:(ow-iw)/2:(oh-ih)/2",
-            "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
-            "-maxrate", "4M", "-bufsize", "8M", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart", output.toString()).redirectError(errors.toFile())
+        val encoder = hostFrameEncoder(ffmpeg, manifest, output, canvasWidth, canvasHeight).redirectError(errors.toFile())
             .redirectOutput(ProcessBuilder.Redirect.DISCARD).start()
         try {
             if (!encoder.waitFor((deadline - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)) {
@@ -156,4 +151,16 @@ internal class HarmonyOSHostFrameRecording(
     private companion object {
         val logger = LoggerFactory.getLogger(HarmonyOSHostFrameRecording::class.java)
     }
+}
+
+internal fun hostFrameEncoder(ffmpeg: Path, manifest: Path, output: Path, canvasWidth: Int, canvasHeight: Int): ProcessBuilder {
+    val directory = manifest.toAbsolutePath().normalize().parent
+    require(output.toAbsolutePath().normalize().parent == directory)
+    // The concat demuxer resolves entries as URLs. A '#' in an absolute manifest path changes their base.
+    return ProcessBuilder(ffmpeg.toString(), "-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
+        "-f", "concat", "-safe", "1", "-i", manifest.fileName.toString(), "-an", "-vf",
+        "scale=$canvasWidth:$canvasHeight:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=$canvasWidth:$canvasHeight:(ow-iw)/2:(oh-ih)/2",
+        "-fps_mode", "vfr", "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+        "-maxrate", "4M", "-bufsize", "8M", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", output.fileName.toString()).directory(directory.toFile())
 }

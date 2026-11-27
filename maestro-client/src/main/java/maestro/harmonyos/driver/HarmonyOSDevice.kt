@@ -24,6 +24,10 @@ interface HarmonyOSDevice {
     fun hierarchy(timeout: Duration): TreeNode
     fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<TreeNode> = emptyList()): List<TreeNode> =
         throw UnsupportedOperationException("This HarmonyOS device backend does not support CSS selectors.")
+    fun installHap(hap: HarmonyOSHap, replace: Boolean, timeout: Duration): Unit =
+        throw UnsupportedOperationException("This HarmonyOS device backend does not support HAP installation.")
+    fun setAppPermission(appId: String, permission: String, allow: Boolean, timeout: Duration): Unit =
+        throw UnsupportedOperationException("This HarmonyOS device backend does not support app permissions.")
     fun screenshot(timeout: Duration): ByteArray
     fun execute(arguments: List<String>, timeout: Duration): String
     fun startScreenRecording(out: Sink, config: HarmonyOSDriverConfig): ScreenRecording =

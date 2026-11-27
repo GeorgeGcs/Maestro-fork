@@ -45,6 +45,7 @@ internal class HarmonyOsAgentCapabilities(
                     if (command.name == "launchApp") add("ability_configured")
                     if (command.name == "setOrientation") add("uitest_rpc_available")
                     if (command.name == "addMedia") add("gallery_import_available")
+                    if (command.name == "setPermissions") add("api_26_debug_app_permission")
                     if (command.recording) {
                         add("recording_enabled")
                         if (hostRecordingSelected) add("host_encoder_available") else {
@@ -141,6 +142,19 @@ internal class HarmonyOsAgentCapabilities(
                 if (available) "GALLERY_TOOL_DISCOVERED" else "PRECONDITION_UNKNOWN",
                 "Media tool discovery does not establish Gallery write access.")
         }
+        if ("setPermissions" in requested) {
+            val api = read(listOf("param", "get", "const.ohos.apiversion"))?.toIntOrNull()
+            val atm = read(listOf("which", "atm"))
+            when {
+                api != null && api < 26 -> check("permissionBackend", "failed", "PERMISSION_API_UNSUPPORTED",
+                    "Changing a debug application's permissions requires API 26 or later.")
+                api != null && atm?.matches(Regex("/[^\\r\\n]+/atm")) == true ->
+                    check("permissionBackend", "passed", "PERMISSION_TOOL_DISCOVERED",
+                        "The device reports API 26 or later and atm. The declared permission is checked at execution.")
+                else -> check("permissionBackend", "unknown", "PRECONDITION_UNKNOWN",
+                    "Could not confirm both the API level and the permission tool.")
+            }
+        }
 
         if (selected.any { it?.screen == true && it.implementation != "unsupported" }) {
             check("screenUnlocked", "unknown", "PRECONDITION_UNKNOWN",
@@ -152,6 +166,18 @@ internal class HarmonyOsAgentCapabilities(
             val confirmed = app != null
             if (confirmed) check("application", "passed", "APP_DISCOVERED", "The bundle query identifies the requested application.")
             else check("application", "unknown", "PRECONDITION_UNKNOWN", "The application query did not confirm the requested bundle; absence was not inferred.")
+            if ("setPermissions" in requested) {
+                val info = app?.get("applicationInfo") ?: app?.get("appInfo")
+                val provision = info?.path("appProvisionType")?.textValue()
+                val debug = info?.path("debug")?.takeIf { it.isBoolean }?.booleanValue()
+                when {
+                    provision == "debug" && debug == true -> check("permissionTarget", "passed", "DEBUG_BUNDLE_CONFIRMED",
+                        "The package is debug signed.")
+                    (provision != null && provision != "debug") || debug == false ->
+                        check("permissionTarget", "failed", "DEBUG_BUNDLE_REQUIRED", "The package must be debug signed.")
+                    else -> check("permissionTarget", "unknown", "PRECONDITION_UNKNOWN", "The package signing type could not be confirmed.")
+                }
+            }
 
             if ("clearState" in requested) {
                 when (HarmonyOSBundleMetadata.dataClearSupport(app)) {
@@ -253,7 +279,7 @@ internal class HarmonyOsAgentCapabilities(
             Command("hideKeyboard", "supported", application = true),
             Command("openLink", "supported"), Command("addMedia", "experimental", screen = false),
             Command("setLocation", "unsupported"), Command("setOrientation", "experimental"),
-            Command("setPermissions", "unsupported"), Command("installApp", "unsupported"),
+            Command("setPermissions", "experimental", screen = false, application = true), Command("installApp", "unsupported"),
         )
     }
 }
