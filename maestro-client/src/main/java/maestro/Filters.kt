@@ -19,9 +19,12 @@
 
 package maestro
 
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.runBlocking
 import maestro.UiElement.Companion.toUiElement
 import maestro.UiElement.Companion.toUiElementOrNull
+import maestro.harmonyos.layout.ArkWebLoopback
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.math.abs
 
 typealias ElementFilter = (List<TreeNode>) -> List<TreeNode>
@@ -298,7 +301,10 @@ object Filters {
 
     fun css(maestro: Maestro, cssSelector: String): ElementFilter {
         return { nodes ->
-            val matchingNodes = runBlocking { maestro.findElementsByOnDeviceQuery(
+            // The synchronous selector starts another coroutine before dispatching the lookup to IO.
+            val tapScope = ArkWebLoopback.cssTapScope
+            val lookupContext = tapScope.get()?.let { tapScope.asContextElement(it) } ?: EmptyCoroutineContext
+            val matchingNodes = runBlocking(lookupContext) { maestro.findElementsByOnDeviceQuery(
                 timeoutMs = 5000,
                 query = OnDeviceElementQuery.Css(css = cssSelector),
                 hierarchyNodes = nodes,

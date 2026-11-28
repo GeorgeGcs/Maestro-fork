@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory
 import java.net.Proxy
 import java.net.URI
 import java.time.Duration
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -48,7 +49,7 @@ internal class ArkWebLoopback(
         }
     }
 
-    fun snapshot(bounds: List<Int>, timeout: Duration, verifyForward: (Duration) -> Boolean): TreeNode? =
+    fun snapshot(bounds: List<Int>, timeout: Duration, verifyForward: (Duration) -> String?): TreeNode? =
         read(bounds, timeout, "window.maestro.getContentDescription()", verifyForward)
             ?.let { json.readValue(it, TreeNode::class.java) }
 
@@ -56,7 +57,7 @@ internal class ArkWebLoopback(
         selector: String,
         bounds: List<Int>,
         timeout: Duration,
-        verifyForward: (Duration) -> Boolean,
+        verifyForward: (Duration) -> String?,
     ): List<TreeNode>? {
         val argument = json.writeValueAsString(selector)
         val operation = """(() => {
@@ -76,11 +77,12 @@ internal class ArkWebLoopback(
         point: Point,
         bounds: List<Int>,
         timeout: Duration,
-        verifyForward: (Duration) -> Boolean,
+        forceVerification: Boolean,
+        verifyForward: (Duration) -> String?,
     ): String? {
         val operation = "window.maestro.arkWebTapHit(${json.writeValueAsString(selector)}, " +
             "${json.writeValueAsString(nodeId)}, ${point.x}, ${point.y})"
-        val reply = read(bounds, timeout, operation, verifyForward) ?: return null
+        val reply = read(bounds, timeout, operation, verifyForward, forceVerification) ?: return null
         return json.readTree(reply)?.textValue()?.takeIf { it.isNotBlank() }
     }
 
@@ -89,7 +91,8 @@ internal class ArkWebLoopback(
         bounds: List<Int>,
         timeout: Duration,
         operation: String,
-        verifyForward: (Duration) -> Boolean,
+        verifyForward: (Duration) -> String?,
+        forceVerification: Boolean = false,
     ): String? {
         val deadline = System.nanoTime() + timeout.toNanos()
         fun remaining(): Duration {
@@ -97,36 +100,53 @@ internal class ArkWebLoopback(
             if (nanos <= 0) throw java.util.concurrent.TimeoutException("ArkWeb snapshot deadline expired")
             return Duration.ofNanos(nanos)
         }
+        val scope = if (target == null) null else cssTapScope.get()
+        val verifyForDispatch = forceVerification && scope != null
         var active = connection?.takeIf { !it.failed && nowNanos() - it.openedAt < FORWARD_TTL_NANOS }
-        val needsVerification = active == null || (target != null &&
-            (active.reusedVerification || nowNanos() - active.verifiedAt >= EXPLICIT_FORWARD_REUSE_NANOS))
-        var verifiedAt = active?.verifiedAt ?: 0L
+        val needsVerification = verifyForDispatch || active == null || (target != null && (
+            active.verifiedScope !== scope || nowNanos() - active.verifiedAt >= EXPLICIT_FORWARD_REUSE_NANOS ||
+                (scope == null && active.reusedVerification)))
         if (needsVerification) {
-            if (!measurePhase("device-forward") { verifyForward(remaining()) }) {
+            val pid = try {
+                measurePhase("device-forward") { verifyForward(remaining()) }
+            } catch (error: Exception) {
+                close()
+                throw error
+            }
+            if (pid == null || (connection != null && connection?.pid != pid)) {
                 logger.debug("ArkWeb device forward not verified")
                 close()
                 return null
             }
-            verifiedAt = nowNanos()
-            active?.apply {
-                this.verifiedAt = verifiedAt
-                reusedVerification = false
-            }
-        } else if (target != null) {
-            checkNotNull(active).reusedVerification = true
-            logger.info("HarmonyOS ArkWeb phase=device-forward-reused elapsedMs=0")
-        }
-        if (active == null) {
-            close()
-            val path = measurePhase("page-discovery") { discoverPage(remaining()) }
-            if (path == null) {
-                logger.debug("ArkWeb page discovery did not confirm a unique loopback target")
+            val verifiedAt = nowNanos()
+            // Keep the freshly verified binding usable for post-tap reads. If the socket will
+            // expire first, rediscover the same page now and require its existing document token.
+            val renewFrom = connection?.takeIf { verifyForDispatch &&
+                FORWARD_TTL_NANOS - (verifiedAt - it.openedAt) < EXPLICIT_FORWARD_REUSE_NANOS }
+            if (renewFrom != null && (renewFrom.failed || renewFrom.documentScope !== scope || renewFrom.documentToken == null)) {
+                close()
                 return null
             }
-            active = Connection(nowNanos(), verifiedAt)
-            active.socket = client.newWebSocket(Request.Builder().url("ws://$endpoint$path").build(), active)
-            connection = active
+            if (active == null || renewFrom != null) {
+                close()
+                val path = measurePhase("page-discovery") { discoverPage(remaining()) } ?: return null
+                if (renewFrom != null && renewFrom.path != path) return null
+                active = Connection(nowNanos(), pid, verifiedAt, path)
+                if (renewFrom != null) {
+                    active.documentScope = scope
+                    active.documentToken = renewFrom.documentToken
+                }
+                active.socket = client.newWebSocket(Request.Builder().url("ws://$endpoint$path").build(), active)
+                connection = active
+            }
+            active.verifiedAt = verifiedAt
+            active.verifiedScope = scope
+            active.reusedVerification = false
+        } else if (target != null) {
+            if (scope == null) checkNotNull(active).reusedVerification = true
+            logger.info("HarmonyOS ArkWeb phase=device-forward-reused elapsedMs=0")
         }
+        checkNotNull(active)
         val (left, top, right, bottom) = bounds
         val capture = "$script; window.maestro.arkWebTapIdentityEnabled = true; maestro.viewportX = $left; maestro.viewportY = $top;" +
             " maestro.viewportWidth = ${right - left}; maestro.viewportHeight = ${bottom - top};" +
@@ -134,8 +154,19 @@ internal class ArkWebLoopback(
         val expression = if (target == null) capture else {
             val url = json.writeValueAsString(target.pageUrl)
             val webViewId = json.writeValueAsString(target.webViewId)
+            // A same-URL reload keeps the socket and marker, but replaces the document.
+            val documentGuard = if (scope == null) "" else {
+                val key = "document[Symbol.for('maestro.arkWebDocument')]"
+                val bind = active.documentScope !== scope
+                if (bind) {
+                    active.documentScope = scope
+                    active.documentToken = UUID.randomUUID().toString()
+                }
+                val token = json.writeValueAsString(active.documentToken)
+                if (bind) " && ($key = $token) === $token" else " && $key === $token"
+            }
             "if (window.location.href === $url && " +
-                "document.querySelector('meta[name=maestro-webview-id]')?.content === $webViewId) { $capture } else { null; }"
+                "document.querySelector('meta[name=maestro-webview-id]')?.content === $webViewId$documentGuard) { $capture } else { null; }"
         }
         val id = ++sequence
         val payload = json.writeValueAsString(mapOf("id" to id, "method" to "Runtime.evaluate",
@@ -178,8 +209,11 @@ internal class ArkWebLoopback(
 
     private data class Pending(val id: Long, val result: CompletableFuture<String>)
 
-    private class Connection(val openedAt: Long, var verifiedAt: Long) : WebSocketListener() {
+    private class Connection(val openedAt: Long, val pid: String, var verifiedAt: Long, val path: String) : WebSocketListener() {
         lateinit var socket: WebSocket
+        var verifiedScope: Any? = null
+        var documentScope: Any? = null
+        var documentToken: String? = null
         var reusedVerification = false
         val pending = AtomicReference<Pending?>()
         @Volatile var failed = false
@@ -209,15 +243,14 @@ internal class ArkWebLoopback(
         }
     }
 
-    private companion object {
-        val FORWARD_TTL_NANOS = TimeUnit.SECONDS.toNanos(5)
-        // Only the next read on an already verified socket can reuse the proof.
-        // URL and WebView marker are still checked for every DOM read.
-        val EXPLICIT_FORWARD_REUSE_NANOS = TimeUnit.SECONDS.toNanos(2)
-        const val MAX_JSON_BYTES = 4L * 1024 * 1024
-        val client = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).followRedirects(false).build()
-        val json = jacksonObjectMapper()
-        val script: String by lazy {
+    companion object {
+        val cssTapScope = ThreadLocal<Any?>()
+        private val FORWARD_TTL_NANOS = TimeUnit.SECONDS.toNanos(5)
+        private val EXPLICIT_FORWARD_REUSE_NANOS = TimeUnit.SECONDS.toNanos(2)
+        private const val MAX_JSON_BYTES = 4L * 1024 * 1024
+        private val client = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).followRedirects(false).build()
+        private val json = jacksonObjectMapper()
+        private val script: String by lazy {
             requireNotNull(ArkWebLoopback::class.java.getResourceAsStream("/maestro-web.js")).bufferedReader().use { it.readText() }
         }
     }

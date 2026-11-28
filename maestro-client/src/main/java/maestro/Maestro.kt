@@ -25,6 +25,8 @@ import maestro.device.AppCrashReport
 import maestro.device.CapturedDeviceArtifact
 import maestro.device.DeviceOrientation
 import maestro.drivers.CdpWebDriver
+import maestro.drivers.HarmonyOSDriver
+import maestro.harmonyos.layout.ArkWebLoopback
 import maestro.utils.MaestroTimer
 import maestro.utils.ScreenshotUtils
 import maestro.utils.SocketUtils
@@ -40,8 +42,10 @@ import java.time.Instant
 import javax.imageio.ImageIO
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlin.system.measureTimeMillis
 
@@ -216,6 +220,12 @@ class Maestro(
         runInterruptible(Dispatchers.IO) { driver.scrollVertical() }
         recentScroll = true
         waitForAppToSettle()
+    }
+
+    /** Keep the checked forward local to this CSS step, including lookups dispatched to IO threads. */
+    suspend fun <T> withCssTapScope(selector: String?, action: suspend () -> T): T {
+        if (selector == null || driver !is HarmonyOSDriver) return action()
+        return withContext(ArkWebLoopback.cssTapScope.asContextElement(Any())) { action() }
     }
 
     suspend fun tap(

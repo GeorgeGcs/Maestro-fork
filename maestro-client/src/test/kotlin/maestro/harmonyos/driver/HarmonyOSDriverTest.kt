@@ -1,7 +1,11 @@
 package maestro.harmonyos.driver
 
 import com.google.common.truth.Truth.assertThat
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import maestro.Filters
 import maestro.KeyCode
 import maestro.Maestro
 import maestro.Point
@@ -14,6 +18,7 @@ import maestro.device.Platform
 import maestro.drivers.HarmonyOSDriver
 import maestro.harmonyos.hdc.HdcException
 import maestro.harmonyos.hdc.HdcTimeoutException
+import maestro.harmonyos.layout.ArkWebLoopback
 import okio.Buffer
 import okio.Sink
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -25,6 +30,31 @@ import java.time.Instant
 import javax.imageio.ImageIO
 
 class HarmonyOSDriverTest {
+    @Test fun `CSS tap scope follows IO lookups and ends on cancellation`() = runBlocking {
+        val device = Device()
+        val driver = driver(device)
+        val maestro = Maestro(driver)
+        val scope = ArkWebLoopback.cssTapScope
+        driver.open()
+        val first = maestro.withCssTapScope(".action") {
+            val step = checkNotNull(scope.get())
+            assertThat(withContext(Dispatchers.IO) { scope.get() }).isSameInstanceAs(step)
+            device.onCssQuery = { assertThat(scope.get()).isSameInstanceAs(step) }
+            Filters.css(maestro, ".action")(emptyList())
+            step
+        }
+        try {
+            maestro.withCssTapScope(".action") {
+                assertThat(checkNotNull(scope.get())).isNotSameInstanceAs(first)
+                throw CancellationException("stop this step")
+            }
+        } catch (_: CancellationException) {
+            assertThat(scope.get()).isNull()
+        }
+        maestro.withCssTapScope(null) { assertThat(scope.get()).isNull() }
+        driver.close()
+    }
+
     @Test fun `CSS repeat checks the original target before each physical dispatch`() {
         val device = Device()
         val driver = driver(device)
@@ -789,6 +819,11 @@ class HarmonyOSDriverTest {
     )
 
     private class Device : HarmonyOSDevice {
+        var onCssQuery: () -> Unit = {}
+        override fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<TreeNode>): List<TreeNode> {
+            onCssQuery()
+            return emptyList()
+        }
         var connections = 0
         var layoutReads = 0
         var screenshots = 0

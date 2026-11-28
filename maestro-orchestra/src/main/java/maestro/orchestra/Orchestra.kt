@@ -1635,9 +1635,8 @@ class Orchestra(
         retryIfNoChange: Boolean,
         waitUntilVisible: Boolean,
         config: MaestroConfig?,
-    ): Boolean {
+    ): Boolean = maestro.withCssTapScope(command.selector.css) {
         val result = findElement(command.selector, optional = command.optional)
-
 
         maestro.tap(
             element = result.element,
@@ -1652,7 +1651,7 @@ class Orchestra(
             relativeTapPoint = command.relativePoint?.let { calculateElementRelativePoint(result.element, it) },
         )
 
-        return true
+        true
     }
 
     private suspend fun tapOnPoint(

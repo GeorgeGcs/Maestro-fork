@@ -313,12 +313,12 @@ class HdcHarmonyOSDevice(
         fun currentTarget(): ArkWebView =
             findArkWebTarget(nativeHierarchy(deadline, remainingBudget(deadline, timeout)))
                 ?: error("$label: native WebView unavailable.")
-        fun checkPoint(target: ArkWebView): String {
+        fun checkPoint(target: ArkWebView, forceVerification: Boolean): String {
             check(target.node.attributes["hostWindowId"] == window) { "$label: native WebView window changed." }
             val (left, top, right, bottom) = target.bounds
             check(point.x in left until right && point.y in top until bottom) { "$label: requested point outside native WebView." }
             return readArkWeb(target, deadline, timeout) { bounds, remaining, verify ->
-                tapHit(selector, nodeId, point, bounds, remaining, verify)
+                tapHit(selector, nodeId, point, bounds, remaining, forceVerification, verify)
             } ?: error("$label: page or hit target unavailable.")
         }
         var target = verifiedArkWebLayout?.freshNativeTarget() ?: currentTarget()
@@ -327,12 +327,12 @@ class HdcHarmonyOSDevice(
         while (true) {
             checkInterrupted()
             if (System.nanoTime() >= pollUntil) error("$label: ${obstruction ?: "hit check timed out"}.")
-            var hit = checkPoint(target)
+            var hit = checkPoint(target, forceVerification = obstruction == null)
             if (hit == "hit" && obstruction != null) {
                 // DOM polling doesn't need another native dump. Refresh the coordinate mapping once
                 // the obstruction lifts, then recheck the point before allowing a physical tap.
                 target = currentTarget()
-                hit = checkPoint(target)
+                hit = checkPoint(target, forceVerification = true)
             }
             checkInterrupted()
             if (hit == "hit") {
@@ -450,7 +450,7 @@ class HdcHarmonyOSDevice(
         target: ArkWebView,
         deadline: Long,
         timeout: Duration,
-        read: ArkWebLoopback.(List<Int>, Duration, (Duration) -> Boolean) -> T?,
+        read: ArkWebLoopback.(List<Int>, Duration, (Duration) -> String?) -> T?,
     ): T? {
         val port = checkNotNull(arkWebPort)
         val bundle = checkNotNull(arkWebBundle)
@@ -464,8 +464,8 @@ class HdcHarmonyOSDevice(
         return checkNotNull(arkWeb).read(target.bounds, budget) { verificationBudget ->
             val webDeadline = System.nanoTime() + verificationBudget.toNanos()
             val pid = execute(listOf("pidof", bundle), remainingBudget(webDeadline, verificationBudget))
-            pid.matches(Regex("[1-9][0-9]*")) &&
-                hdc.hasArkWebForward(deviceId, port, pid, remainingBudget(webDeadline, verificationBudget))
+            pid.takeIf { it.matches(Regex("[1-9][0-9]*")) &&
+                hdc.hasArkWebForward(deviceId, port, it, remainingBudget(webDeadline, verificationBudget)) }
         }
     }
 
