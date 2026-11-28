@@ -25,6 +25,32 @@ import java.time.Instant
 import javax.imageio.ImageIO
 
 class HarmonyOSDriverTest {
+    @Test fun `CSS repeat checks the original target before each physical dispatch`() {
+        val device = Device()
+        val driver = driver(device)
+        val point = Point(9, 16)
+        val node = TreeNode(mutableMapOf("arkweb-node-id" to "doc-7", "bounds" to "[0,0][20,20]"))
+        var checks = 0
+        device.cssHit = { selector, nodeId, actual ->
+            assertThat(selector).isEqualTo(".action")
+            assertThat(nodeId).isEqualTo("doc-7")
+            assertThat(actual).isEqualTo(point)
+            if (++checks == 2) error("blocked by dialog")
+        }
+        driver.open()
+        try {
+            val failure = assertThrows(IllegalStateException::class.java) {
+                runBlocking { Maestro(driver).tap(node.toUiElement(), ViewHierarchy(node), cssSelector = ".action",
+                    relativeTapPoint = point, tapRepeat = maestro.TapRepeat(2, 0)) }
+            }
+            assertThat(failure.message).contains("blocked by dialog")
+            assertThat(checks).isEqualTo(2)
+            assertThat(device.commands).containsExactly(listOf("uitest", "uiInput", "click", "9", "16"))
+        } finally {
+            driver.close()
+        }
+    }
+
     @Test fun `tap target must remain unique visible enabled and in the same window`() {
         val child = TreeNode(mutableMapOf("hostWindowId" to "1", "bounds" to "[5,5][15,15]"))
         val target = TreeNode(mutableMapOf(
@@ -785,6 +811,9 @@ class HarmonyOSDriverTest {
         var focused: () -> Boolean = { true }
         var focusSamples = 0
         var keyboard: () -> Boolean = { false }
+        var cssHit: (String, String, Point) -> Unit = { _, _, _ -> error("Unexpected CSS hit test") }
+        override fun awaitCssTapHit(selector: String, nodeId: String, point: Point, timeout: Duration) =
+            cssHit(selector, nodeId, point)
         override fun keyboardVisible(timeout: Duration): Boolean = keyboard()
         override fun hasAppFocus(appId: String, timeout: Duration): Boolean {
             focusSamples++

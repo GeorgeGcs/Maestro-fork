@@ -1,5 +1,6 @@
 package maestro.harmonyos.driver
 
+import maestro.Point
 import maestro.TreeNode
 import maestro.ScreenRecording
 import okio.Sink
@@ -266,6 +267,7 @@ class HdcHarmonyOSDevice(
         verifiedArkWebLayout = null
         val deadline = System.nanoTime() + timeout.toNanos()
         val nativeTree = nativeHierarchy(deadline, timeout)
+        val nativeReadAt = System.nanoTime()
         val target = findArkWebTarget(nativeTree) ?: return arkWebFallback(nativeTree)
         val dom = try {
             readArkWeb(target, deadline, timeout) { bounds, budget, verify -> snapshot(bounds, budget, verify) }
@@ -279,7 +281,7 @@ class HdcHarmonyOSDevice(
         } ?: return arkWebFallback(nativeTree)
 
         reportArkWebSource("DOM")
-        verifiedArkWebLayout = VerifiedArkWebLayout(target, dom)
+        verifiedArkWebLayout = VerifiedArkWebLayout(target, dom, nativeReadAt)
         fun merge(node: TreeNode): TreeNode = if (node === target.node) {
             node.copy(children = listOf(dom))
         } else {
@@ -302,6 +304,50 @@ class HdcHarmonyOSDevice(
         return readArkWeb(target, deadline, timeout) { bounds, budget, verify ->
             queryCss(selector, bounds, budget, verify)
         } ?: error("CSS query could not read the verified ArkWeb page.")
+    }
+
+    override fun awaitCssTapHit(selector: String, nodeId: String, point: Point, timeout: Duration) {
+        val label = "ArkWeb CSS tap on '$selector'"
+        val window = arkWebWindow?.takeIf { it.isNotBlank() } ?: error("$label: verified WebView window unavailable.")
+        val deadline = System.nanoTime() + timeout.toNanos()
+        fun currentTarget(): ArkWebView =
+            findArkWebTarget(nativeHierarchy(deadline, remainingBudget(deadline, timeout)))
+                ?: error("$label: native WebView unavailable.")
+        fun checkPoint(target: ArkWebView): String {
+            check(target.node.attributes["hostWindowId"] == window) { "$label: native WebView window changed." }
+            val (left, top, right, bottom) = target.bounds
+            check(point.x in left until right && point.y in top until bottom) { "$label: requested point outside native WebView." }
+            return readArkWeb(target, deadline, timeout) { bounds, remaining, verify ->
+                tapHit(selector, nodeId, point, bounds, remaining, verify)
+            } ?: error("$label: page or hit target unavailable.")
+        }
+        var target = verifiedArkWebLayout?.freshNativeTarget() ?: currentTarget()
+        var pollUntil = deadline
+        var obstruction: String? = null
+        while (true) {
+            checkInterrupted()
+            if (System.nanoTime() >= pollUntil) error("$label: ${obstruction ?: "hit check timed out"}.")
+            var hit = checkPoint(target)
+            if (hit == "hit" && obstruction != null) {
+                // DOM polling doesn't need another native dump. Refresh the coordinate mapping once
+                // the obstruction lifts, then recheck the point before allowing a physical tap.
+                target = currentTarget()
+                hit = checkPoint(target)
+            }
+            checkInterrupted()
+            if (hit == "hit") {
+                check(System.nanoTime() < deadline) { "$label: hit check timed out." }
+                return
+            }
+            check(hit.startsWith("blocked by ") || hit == "no element at tap point") { "$label: $hit." }
+            if (obstruction == null) {
+                logger.info("{}: {}", label, hit)
+                pollUntil = minOf(deadline, System.nanoTime() + Duration.ofSeconds(3).toNanos())
+            }
+            obstruction = hit
+            val pause = minOf(Duration.ofMillis(100).toNanos(), pollUntil - System.nanoTime())
+            if (pause > 0) java.util.concurrent.TimeUnit.NANOSECONDS.sleep(pause)
+        }
     }
 
     override fun installHap(hap: HarmonyOSHap, replace: Boolean, timeout: Duration) {
@@ -365,7 +411,7 @@ class HdcHarmonyOSDevice(
 
     private data class ArkWebView(val node: TreeNode, val bounds: List<Int>)
 
-    private class VerifiedArkWebLayout(val target: ArkWebView, dom: TreeNode) {
+    private class VerifiedArkWebLayout(val target: ArkWebView, dom: TreeNode, private val nativeReadAt: Long) {
         private val capturedAt = System.nanoTime()
         // Bounds filtering keeps the original attributes map even when it copies a node.
         private val attributes by lazy {
@@ -375,6 +421,10 @@ class HdcHarmonyOSDevice(
         fun matches(nodes: List<TreeNode>): Boolean = nodes.isNotEmpty() &&
             System.nanoTime() - capturedAt <= Duration.ofMillis(250).toNanos() &&
             nodes.any { it.attributes in attributes }
+
+        fun freshNativeTarget(): ArkWebView? = target.takeIf {
+            System.nanoTime() - nativeReadAt <= Duration.ofMillis(250).toNanos()
+        }
     }
 
     private fun findArkWebTarget(nativeTree: TreeNode): ArkWebView? {

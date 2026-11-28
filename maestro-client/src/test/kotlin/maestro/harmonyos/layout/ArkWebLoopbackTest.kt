@@ -2,6 +2,7 @@ package maestro.harmonyos.layout
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.google.common.truth.Truth.assertThat
+import maestro.Point
 import maestro.harmonyos.driver.HarmonyOSArkWebTarget
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -12,6 +13,48 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import java.time.Duration
 
 class ArkWebLoopbackTest {
+    @Test
+    fun `tap hit carries the original node and tap coordinates to the verified page`() {
+        val json = ObjectMapper()
+        val selector = """[data-name="first"]"""
+        val nodeId = "doc-1"
+        val operation = "window.maestro.arkWebTapHit(${json.writeValueAsString(selector)}, \"doc-1\", 79, 131)"
+        val expressions = java.util.concurrent.CopyOnWriteArrayList<String>()
+        MockWebServer().use { server ->
+            server.start(java.net.InetAddress.getByName("127.0.0.1"), 0)
+            server.enqueue(MockResponse().setBody(
+                """[{"type":"page","url":"https://example.test/two","webSocketDebuggerUrl":"ws://127.0.0.1:${server.port}/devtools/page/two"}]"""
+            ))
+            server.enqueue(MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val request = json.readTree(text)
+                    expressions += request.path("params").path("expression").asText()
+                    val reply = if (expressions.size == 1) "blocked by div#overlay" else "hit"
+                    webSocket.send(json.writeValueAsString(mapOf(
+                        "id" to request.path("id").asLong(),
+                        "result" to mapOf("result" to mapOf("value" to json.writeValueAsString(reply))),
+                    )))
+                }
+            }))
+            val target = HarmonyOSArkWebTarget("probe-secondary", "https://example.test/two")
+            ArkWebLoopback(server.port, target).use { browser ->
+                fun hit(forward: Boolean) = browser.tapHit(selector, nodeId, Point(79, 131),
+                    listOf(5, 30, 105, 230), Duration.ofSeconds(2)) { forward }
+                assertThat(hit(true)).isEqualTo("blocked by div#overlay")
+                assertThat(hit(true)).isEqualTo("hit")
+                assertThat(hit(false)).isNull()
+                assertThat(expressions).hasSize(2)
+                for (expression in expressions) {
+                    assertThat(expression).contains("window.location.href === \"https://example.test/two\"")
+                    assertThat(expression).contains("?.content === \"probe-secondary\"")
+                    assertThat(expression).contains("window.maestro.arkWebTapIdentityEnabled = true")
+                    assertThat(expression).contains("maestro.viewportX = 5; maestro.viewportY = 30;")
+                    assertThat(expression).contains(operation)
+                }
+            }
+        }
+    }
+
     @Test
     fun `CSS separates matches no matches and an invalid selector from a lost target`() {
         val json = ObjectMapper()

@@ -1,6 +1,7 @@
 package maestro.harmonyos.layout
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import maestro.Point
 import maestro.TreeNode
 import maestro.harmonyos.driver.HarmonyOSArkWebTarget
 import okhttp3.OkHttpClient
@@ -69,6 +70,20 @@ internal class ArkWebLoopback(
         return nodes.filterNot { it.isNull }.map { json.treeToValue(it, TreeNode::class.java) }
     }
 
+    fun tapHit(
+        selector: String,
+        nodeId: String,
+        point: Point,
+        bounds: List<Int>,
+        timeout: Duration,
+        verifyForward: (Duration) -> Boolean,
+    ): String? {
+        val operation = "window.maestro.arkWebTapHit(${json.writeValueAsString(selector)}, " +
+            "${json.writeValueAsString(nodeId)}, ${point.x}, ${point.y})"
+        val reply = read(bounds, timeout, operation, verifyForward) ?: return null
+        return json.readTree(reply)?.textValue()?.takeIf { it.isNotBlank() }
+    }
+
     @Synchronized
     private fun read(
         bounds: List<Int>,
@@ -113,7 +128,7 @@ internal class ArkWebLoopback(
             connection = active
         }
         val (left, top, right, bottom) = bounds
-        val capture = "$script; maestro.viewportX = $left; maestro.viewportY = $top;" +
+        val capture = "$script; window.maestro.arkWebTapIdentityEnabled = true; maestro.viewportX = $left; maestro.viewportY = $top;" +
             " maestro.viewportWidth = ${right - left}; maestro.viewportHeight = ${bottom - top};" +
             " JSON.stringify($operation, window.maestro.cycleSafeReplacer());"
         val expression = if (target == null) capture else {

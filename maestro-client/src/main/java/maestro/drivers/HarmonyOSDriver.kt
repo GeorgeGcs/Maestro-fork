@@ -224,6 +224,15 @@ class HarmonyOSDriver(
         input("longClick", point.x.toString(), point.y.toString())
     }
 
+    internal fun tapArkWebTarget(selector: String, nodeId: String, point: Point, longPress: Boolean) {
+        requireOpen()
+        validatePoint(point, deviceInfo())
+        query {
+            device.awaitCssTapHit(selector, nodeId, point, config.commandTimeout)
+            input(if (longPress) "longClick" else "click", point.x.toString(), point.y.toString())
+        }
+    }
+
     override fun pressKey(code: KeyCode) {
         val key = when (code) {
             KeyCode.BACK -> "Back"

@@ -89,6 +89,24 @@
         return typeof attribute === 'string' && attribute !== '' ? attribute : null
     }
 
+    // ArkWeb reinjects this script for every read. Keep identity across reads without retaining detached nodes.
+    const arkWebNodeId = (node) => {
+        if (!maestro.arkWebNodeIds) {
+            maestro.arkWebNodeIds = {
+                nodes: new WeakMap(),
+                prefix: crypto.getRandomValues(new Uint32Array(4)).join('-'),
+                next: 0,
+            }
+        }
+        const state = maestro.arkWebNodeIds
+        let id = state.nodes.get(node)
+        if (!id) {
+            id = state.prefix + '-' + (++state.next)
+            state.nodes.set(node, id)
+        }
+        return id
+    }
+
     const traverse = (node, includeChildren = true, iframeOffsetX = 0, iframeOffsetY = 0) => {
       if (!node || isInvalidTag(node)) return null
 
@@ -128,6 +146,9 @@
       const attributes = {
           text: getNodeText(node),
           bounds: getNodeBounds(node, iframeOffsetX, iframeOffsetY),
+      }
+      if (maestro.arkWebTapIdentityEnabled) {
+          attributes['arkweb-node-id'] = arkWebNodeId(node)
       }
 
       // If this is an <option> element, we only want to include it if the parent <select> element is focused.
@@ -193,6 +214,27 @@
         return Array.from(elements).map(el => {
             return traverse(el, false);
         });
+    }
+
+    maestro.arkWebTapHit = (selector, nodeId, physicalX, physicalY) => {
+        if (!maestro.arkWebTapIdentityEnabled || !nodeId) return 'target identity unavailable'
+        const nodes = maestro.arkWebNodeIds?.nodes
+        const target = Array.from(document.querySelectorAll(selector)).find(node => nodes?.get(node) === nodeId)
+        if (!target) return 'target changed or no longer matches'
+
+        const width = maestro.viewportWidth || window.innerWidth
+        const height = maestro.viewportHeight || window.innerHeight
+        const x = (physicalX - maestro.viewportX) * window.innerWidth / width
+        const y = (physicalY - maestro.viewportY) * window.innerHeight / height
+        if (!(x >= 0 && x < window.innerWidth && y >= 0 && y < window.innerHeight)) {
+            return 'tap point outside WebView'
+        }
+        const receiver = document.elementFromPoint(x, y)
+        if (!receiver) return 'no element at tap point'
+        if (Node.prototype.contains.call(target, receiver)) return 'hit'
+        const tag = receiver.localName.slice(0, 32)
+        const id = Element.prototype.getAttribute.call(receiver, 'id') || ''
+        return 'blocked by ' + tag + (id ? '#' + id.slice(0, 64).replace(/[^a-zA-Z0-9_-]/g, '_') : '')
     }
 
     maestro.tapOnSyntheticElement = (x, y) => {

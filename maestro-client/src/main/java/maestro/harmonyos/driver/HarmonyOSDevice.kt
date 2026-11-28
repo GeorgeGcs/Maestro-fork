@@ -1,6 +1,7 @@
 package maestro.harmonyos.driver
 
 import maestro.TreeNode
+import maestro.Point
 import maestro.ScreenRecording
 import okio.Sink
 import java.nio.file.Path
@@ -24,6 +25,8 @@ interface HarmonyOSDevice {
     fun hierarchy(timeout: Duration): TreeNode
     fun queryCss(selector: String, timeout: Duration, hierarchyNodes: List<TreeNode> = emptyList()): List<TreeNode> =
         throw UnsupportedOperationException("This HarmonyOS device backend does not support CSS selectors.")
+    fun awaitCssTapHit(selector: String, nodeId: String, point: Point, timeout: Duration): Unit =
+        throw UnsupportedOperationException("This HarmonyOS device backend cannot verify the ArkWeb CSS tap on '$selector'.")
     fun installHap(hap: HarmonyOSHap, replace: Boolean, timeout: Duration): Unit =
         throw UnsupportedOperationException("This HarmonyOS device backend does not support HAP installation.")
     fun setAppPermission(appId: String, permission: String, allow: Boolean, timeout: Duration): Unit =

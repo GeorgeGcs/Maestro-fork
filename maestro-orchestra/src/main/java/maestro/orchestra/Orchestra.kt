@@ -1639,32 +1639,18 @@ class Orchestra(
         val result = findElement(command.selector, optional = command.optional)
 
 
-        // Handle element-relative tap if specified
-        val relativePoint = command.relativePoint
-        if (relativePoint != null) {
-            val tapPoint = calculateElementRelativePoint(result.element, relativePoint)      
-                  
-            maestro.tap(
-                x = tapPoint.x,
-                y = tapPoint.y,
-                retryIfNoChange = retryIfNoChange,
-                longPress = command.longPress ?: false,
-                tapRepeat = command.repeat,
-                waitToSettleTimeoutMs = command.waitToSettleTimeoutMs,
-            )
-        } else {
-            // Default behavior: tap at element center
-            maestro.tap(
-                element = result.element,
-                initialHierarchy = result.hierarchy,
-                retryIfNoChange = retryIfNoChange,
-                waitUntilVisible = waitUntilVisible,
-                longPress = command.longPress ?: false,
-                appId = config?.appId,
-                tapRepeat = command.repeat,
-                waitToSettleTimeoutMs = command.waitToSettleTimeoutMs,
-            )
-        }
+        maestro.tap(
+            element = result.element,
+            initialHierarchy = result.hierarchy,
+            retryIfNoChange = retryIfNoChange,
+            waitUntilVisible = waitUntilVisible,
+            longPress = command.longPress ?: false,
+            appId = config?.appId,
+            tapRepeat = command.repeat,
+            waitToSettleTimeoutMs = command.waitToSettleTimeoutMs,
+            cssSelector = command.selector.css,
+            relativeTapPoint = command.relativePoint?.let { calculateElementRelativePoint(result.element, it) },
+        )
 
         return true
     }

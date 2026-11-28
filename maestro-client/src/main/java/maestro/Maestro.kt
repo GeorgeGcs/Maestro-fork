@@ -226,9 +226,23 @@ class Maestro(
         longPress: Boolean = false,
         appId: String? = null,
         tapRepeat: TapRepeat? = null,
-        waitToSettleTimeoutMs: Int? = null
+        waitToSettleTimeoutMs: Int? = null,
+        cssSelector: String? = null,
+        relativeTapPoint: Point? = null,
     ) {
         LOGGER.info("Tapping on element: ${tapRepeat ?: ""} $element")
+
+        val checkedTap: ((Point, Boolean) -> Unit)? = if (cssSelector != null && driver is maestro.drivers.HarmonyOSDriver) {
+            val nodeId = checkNotNull(element.treeNode.attributes["arkweb-node-id"]) {
+                "Cannot verify the ArkWeb target for CSS selector $cssSelector."
+            }
+            fun(point: Point, hold: Boolean) { driver.tapArkWebTarget(cssSelector, nodeId, point, hold) }
+        } else null
+        if (relativeTapPoint != null) {
+            performTap(relativeTapPoint.x, relativeTapPoint.y, retryIfNoChange, longPress,
+                tapRepeat = tapRepeat, waitToSettleTimeoutMs = waitToSettleTimeoutMs, checkedTap = checkedTap)
+            return
+        }
 
         var settleFrom = initialHierarchy
         val confirmedTarget = if (driver is maestro.drivers.HarmonyOSDriver &&
@@ -275,7 +289,8 @@ class Maestro(
             longPress = longPress,
             initialHierarchy = hierarchyBeforeTap,
             tapRepeat = tapRepeat,
-            waitToSettleTimeoutMs = waitToSettleTimeoutMs
+            waitToSettleTimeoutMs = waitToSettleTimeoutMs,
+            checkedTap = checkedTap,
         )
 
         if (waitUntilVisible) {
@@ -294,7 +309,8 @@ class Maestro(
                     retryIfNoChange = false,
                     waitUntilVisible = false,
                     longPress = longPress,
-                    tapRepeat = tapRepeat
+                    tapRepeat = tapRepeat,
+                    cssSelector = cssSelector,
                 )
             }
         }
@@ -406,21 +422,39 @@ class Maestro(
         longPress: Boolean = false,
         initialHierarchy: ViewHierarchy? = null,
         tapRepeat: TapRepeat? = null,
-        waitToSettleTimeoutMs: Int? = null
+        waitToSettleTimeoutMs: Int? = null,
+        checkedTap: ((Point, Boolean) -> Unit)? = null,
     ) {
         recentScroll = false // consume the scroll hint (MA-4135)
 
+        val point = Point(x, y)
+        val dispatch: suspend () -> Unit = {
+            val repeats = if (longPress) 1 else tapRepeat?.repeat ?: 1
+            repeat(repeats) {
+                val duration = measureTimeMillis {
+                    runInterruptible(Dispatchers.IO) {
+                        when {
+                            checkedTap != null -> checkedTap(point, longPress)
+                            longPress -> driver.longPress(point)
+                            else -> driver.tap(point)
+                        }
+                    }
+                }
+                if (repeats > 1 && tapRepeat != null) delay((tapRepeat.delay - duration).coerceAtLeast(0))
+            }
+        }
+
         if (driver is maestro.drivers.HarmonyOSDriver && !retryIfNoChange) {
-            hierarchyBasedTap(x, y, false, longPress, initialHierarchy, tapRepeat, waitToSettleTimeoutMs)
+            hierarchyBasedTap(x, y, false, initialHierarchy, waitToSettleTimeoutMs, dispatch)
             return
         }
 
         val capabilities = runInterruptible(Dispatchers.IO) { driver.capabilities() }
 
         if (Capability.FAST_HIERARCHY in capabilities) {
-            hierarchyBasedTap(x, y, retryIfNoChange, longPress, initialHierarchy, tapRepeat, waitToSettleTimeoutMs)
+            hierarchyBasedTap(x, y, retryIfNoChange, initialHierarchy, waitToSettleTimeoutMs, dispatch)
         } else {
-            screenshotBasedTap(x, y, retryIfNoChange, longPress, initialHierarchy, tapRepeat, waitToSettleTimeoutMs)
+            screenshotBasedTap(x, y, retryIfNoChange, initialHierarchy, waitToSettleTimeoutMs, dispatch)
         }
     }
 
@@ -428,10 +462,9 @@ class Maestro(
         x: Int,
         y: Int,
         retryIfNoChange: Boolean = false,
-        longPress: Boolean = false,
         initialHierarchy: ViewHierarchy? = null,
-        tapRepeat: TapRepeat? = null,
-        waitToSettleTimeoutMs: Int? = null
+        waitToSettleTimeoutMs: Int? = null,
+        dispatch: suspend () -> Unit,
     ) {
         LOGGER.info("Tapping at ($x, $y) using hierarchy based logic for wait")
 
@@ -439,22 +472,7 @@ class Maestro(
 
         val retries = getNumberOfRetries(retryIfNoChange)
         repeat(retries) {
-            if (longPress) {
-                runInterruptible(Dispatchers.IO) { driver.longPress(Point(x, y)) }
-            } else if (tapRepeat != null) {
-                for (i in 0 until tapRepeat.repeat) {
-
-                    // subtract execution duration from tap delay
-                    val duration = measureTimeMillis {
-                        runInterruptible(Dispatchers.IO) { driver.tap(Point(x, y)) }
-                    }
-                    val tapDelay = if (duration >= tapRepeat.delay) 0 else tapRepeat.delay - duration
-
-                    if (tapRepeat.repeat > 1) delay(tapDelay) // do not wait for single taps
-                }
-            } else {
-                runInterruptible(Dispatchers.IO) { driver.tap(Point(x, y)) }
-            }
+            dispatch()
             val hierarchyAfterTap = waitForAppToSettle(waitToSettleTimeoutMs = waitToSettleTimeoutMs)
 
             if (hierarchyAfterTap == null || hierarchyBeforeTap != hierarchyAfterTap) {
@@ -468,10 +486,9 @@ class Maestro(
         x: Int,
         y: Int,
         retryIfNoChange: Boolean = false,
-        longPress: Boolean = false,
         initialHierarchy: ViewHierarchy? = null,
-        tapRepeat: TapRepeat? = null,
-        waitToSettleTimeoutMs: Int? = null
+        waitToSettleTimeoutMs: Int? = null,
+        dispatch: suspend () -> Unit,
     ) {
         LOGGER.info("Try tapping at ($x, $y) using hierarchy based logic for wait")
 
@@ -480,22 +497,7 @@ class Maestro(
 
         val retries = getNumberOfRetries(retryIfNoChange)
         repeat(retries) {
-            if (longPress) {
-                runInterruptible(Dispatchers.IO) { driver.longPress(Point(x, y)) }
-            } else if (tapRepeat != null) {
-                for (i in 0 until tapRepeat.repeat) {
-
-                    // subtract execution duration from tap delay
-                    val duration = measureTimeMillis {
-                        runInterruptible(Dispatchers.IO) { driver.tap(Point(x, y)) }
-                    }
-                    val tapDelay = if (duration >= tapRepeat.delay) 0 else tapRepeat.delay - duration
-
-                    if (tapRepeat.repeat > 1) delay(tapDelay) // do not wait for single taps
-                }
-            } else {
-                runInterruptible(Dispatchers.IO) { driver.tap(Point(x, y)) }
-            }
+            dispatch()
             val hierarchyAfterTap = waitForAppToSettle(waitToSettleTimeoutMs = waitToSettleTimeoutMs)
 
             if (hierarchyBeforeTap != hierarchyAfterTap) {
